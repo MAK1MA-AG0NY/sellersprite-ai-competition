@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>卖家精灵 · 竞品深挖控制台</title>
+<style>
+  :root {
+    --orange: #ff7a1a; --orange-dark: #e8620a; --bg: #f5f6fa;
+    --card: #ffffff; --text: #26303e; --muted: #8a94a6;
+    --green: #22a06b; --red: #e5484d; --yellow: #f5a623; --line: #e8ebf1;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }
+  header {
+    background: linear-gradient(120deg, #ff8c2e 0%, #ff6a00 60%, #f05a00 100%);
+    color: #fff; padding: 26px 36px 22px; box-shadow: 0 2px 12px rgba(240,90,0,.25);
+  }
+  header h1 { font-size: 22px; letter-spacing: 1px; }
+  header p { opacity: .85; font-size: 13px; margin-top: 6px; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 60px; }
+  .card {
+    background: var(--card); border-radius: 14px; padding: 22px 24px; margin-top: 20px;
+    box-shadow: 0 1px 4px rgba(38,48,62,.06); border: 1px solid var(--line);
+  }
+  .card h2 { font-size: 16px; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .num {
+    width: 24px; height: 24px; border-radius: 50%; background: var(--orange); color: #fff;
+    display: inline-flex; align-items: center; justify-content: center; font-size: 13px;
+  }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; }
+  .row > .card { flex: 1; min-width: 340px; margin-top: 0; }
+  .account { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .account .info b { font-size: 15px; }
+  .account .info span { display: block; color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  .badge {
+    display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 12px; margin-left: 8px;
+  }
+  .badge.ok  { background: #e6f7ef; color: var(--green); }
+  .badge.no  { background: #fdecec; color: var(--red); }
+  .badge.vip { background: #fff3e0; color: var(--orange-dark); }
+  button {
+    border: none; border-radius: 8px; padding: 9px 18px; font-size: 13.5px; cursor: pointer;
+    background: var(--orange); color: #fff; transition: .15s; font-family: inherit;
+  }
+  button:hover { background: var(--orange-dark); }
+  button:disabled { background: #cbd2dd; cursor: not-allowed; }
+  button.ghost { background: #fff; color: var(--orange-dark); border: 1px solid var(--orange); }
+  button.ghost:hover { background: #fff7ef; }
+  button.sm { padding: 6px 12px; font-size: 12.5px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 8px 10px; border-bottom: 2px solid var(--line); }
+  td { padding: 9px 10px; border-bottom: 1px solid var(--line); }
+  tr.sel td { background: #fff4ea; }
+  tr:hover td { background: #fafbfe; cursor: pointer; }
+  .st-COMPLETED { color: var(--green); font-weight: 600; }
+  .st-SUBMITTED { color: var(--yellow); font-weight: 600; }
+  .st-? { color: var(--muted); }
+  .bar { height: 10px; background: #eef0f5; border-radius: 6px; overflow: hidden; margin: 12px 0 6px; }
+  .bar i { display: block; height: 100%; width: 0; border-radius: 6px;
+           background: linear-gradient(90deg, #ffa050, var(--orange)); transition: width .4s; }
+  .log {
+    background: #1d2430; color: #d7e0ee; border-radius: 10px; padding: 14px 16px;
+    font: 12px/1.7 Consolas, monospace; height: 210px; overflow-y: auto; white-space: pre-wrap;
+  }
+  .muted { color: var(--muted); font-size: 12.5px; }
+  .flex { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  input[type=number] {
+    width: 90px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 14px;
+  }
+  select.sel {
+    padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 14px;
+    background: #fff; color: var(--text); font-family: inherit;
+  }
+  .toast {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
+    background: #26303e; color: #fff; padding: 10px 22px; border-radius: 10px;
+    font-size: 13.5px; box-shadow: 0 4px 16px rgba(0,0,0,.25); display: none; z-index: 99;
+  }
+  .asins-preview {
+    background: #fafbfe; border: 1px dashed var(--line); border-radius: 10px;
+    padding: 10px 14px; font: 12px Consolas, monospace; color: #556; max-height: 110px;
+    overflow-y: auto; margin-top: 10px; line-height: 1.8;
+  }
+  a.dl { color: var(--orange-dark); font-weight: 600; text-decoration: none; }
+  a.dl:hover { text-decoration: underline; }
+  /* 💡 提示工具 */
+  .tip { position: relative; display: inline-flex; cursor: help; font-size: 15px; line-height: 1;
+         filter: saturate(.9); }
+  .tip:hover { filter: none; }
+  .tip .tipbox {
+    display: none; position: absolute; bottom: calc(100% + 9px); left: 50%; transform: translateX(-50%);
+    width: 360px; background: rgba(38,48,62,.97); color: #fff; border-radius: 9px;
+    padding: 10px 13px; font-size: 12.5px; line-height: 1.8; text-align: left; font-weight: normal;
+    box-shadow: 0 6px 20px rgba(0,0,0,.28); z-index: 100; white-space: normal; cursor: default;
+  }
+  .tip .tipbox::after {
+    content: ''; position: absolute; top: 100%; left: 50%; margin-left: -6px;
+    border: 6px solid transparent; border-top-color: rgba(38,48,62,.97);
+  }
+  .tip .tipbox::before { content: ''; position: absolute; top: -10px; left: 0; right: 0; height: 10px; }
+  .tip:hover .tipbox { display: block; }
+  .tip .tipbox b { color: #ffb37a; font-weight: 600; }
+  .tip .tipbox ul { margin: 5px 0 2px 16px; }
+  .tip .tipbox li { margin: 3px 0; }
+  .pool-chip {
+    display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line);
+    border-radius: 8px; padding: 4px 8px; font-size: 12.5px; background: #fafbfe;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>卖家精灵 · 竞品深挖控制台</h1>
+  <p>AI找竞品(主账号, 可换号) → 提取竞品ASIN → 竞品详情批量查询(会员账号) → Excel 导出</p>
+</header>
+<div class="wrap">
+
+  <div class="row">
+    <div class="card">
+      <h2><span class="num">🔑</span>主账号 · AI找竞品 <span id="main-badge" class="badge no">未登录</span></h2>
+      <div class="account">
+        <div class="info"><b id="main-nick">-</b><span id="main-sub">用于拉取历史任务与提取竞品 ASIN，可随时更换账号</span></div>
+        <div style="display:flex; gap:8px;">
+          <button class="ghost sm" onclick="login('main', false)">打开登录窗口</button>
+          <button class="sm" id="main-ok" onclick="login('main', true)">我登录好了</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h2><span class="num">👑</span>会员账号 · 竞品查询 <span id="member-badge" class="badge no">未登录</span></h2>
+      <div class="account">
+        <div class="info"><b id="member-nick">-</b><span id="member-sub">competitor-lookup 为会员功能，建议固定一个会员账号</span></div>
+        <div style="display:flex; gap:8px;">
+          <button class="ghost sm" onclick="login('member', false)">打开登录窗口</button>
+          <button class="sm" id="member-ok" onclick="login('member', true)">我登录好了</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><span class="num">1</span>AI 找竞品 · 提交新任务（主账号执行，消耗每日配额）</h2>
+    <div class="flex">
+      <label class="muted">站点 <select id="cl-site" class="sel"><option value="">页面默认</option></select></label>
+      <label class="muted">竞品数量 <select id="cl-count" class="sel"><option value="">页面默认</option></select></label>
+      <button class="ghost sm" onclick="loadClOptions()">读取页面可选值</button>
+    </div>
+    <div class="flex" style="margin-top:12px;">
+      <input id="cl-asins" type="text" placeholder="输入 ASIN，多个用空格/逗号分隔（多个任务将串行提交并等待）"
+             style="flex:1; min-width:280px; padding:9px 12px; border:1px solid var(--line); border-radius:8px; font-size:14px;">
+      <label class="muted"><input type="checkbox" id="cl-auto" checked> 完成后自动提取</label>
+      <button id="btn-cl" onclick="startCl()">开始提交</button>
+    </div>
+    <div class="bar"><i id="cl-bar"></i></div>
+    <div class="muted" id="cl-prog">尚未开始</div>
+    <div id="cl-log" class="log" style="margin-top:12px; height:170px;">等待任务…</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="num">2</span>历史任务 <button class="ghost sm" onclick="loadHistory()">刷新列表</button>
+      <span id="his-meta" class="muted"></span></h2>
+    <div style="max-height: 300px; overflow-y: auto;">
+      <table>
+        <thead><tr><th style="width:40px;"></th><th>状态</th><th>分析时间</th><th>站点</th><th>ASIN</th><th>taskId</th><th>来源</th></tr></thead>
+        <tbody id="his-body"><tr><td colspan="7" class="muted">点击“刷新列表”加载…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><span class="num">3</span>提取竞品 ASIN
+      <span id="asins-meta" class="muted"></span></h2>
+    <button id="btn-extract" onclick="extractAsins()" disabled>从选中任务提取 ASIN</button>
+    <div id="asins-preview" class="asins-preview" style="display:none;"></div>
+  </div>
+
+  <div class="card">
+    <h2><span class="num">4</span>竞品详情批量查询（会员账号执行）
+      <span id="probe-badge" class="badge no">接口未探测</span></h2>
+    <div class="flex">
+      <label>每批 ASIN 数 <input type="number" id="chunk" value="150" min="1" max="500"></label>
+      <button id="btn-lookup" onclick="startLookup()" disabled>开始批量查询</button>
+      <span class="muted">查询在服务端后台执行，可随时刷新本页查看进度</span>
+    </div>
+    <div class="bar"><i id="bar"></i></div>
+    <div class="muted" id="prog-text">尚未开始</div>
+    <div id="log" class="log" style="margin-top:12px;">等待任务…</div>
+    <div style="margin-top:12px;"><a id="dl" class="dl" style="display:none;" href="#">⬇ 下载 Excel 报告</a></div>
+  </div>
+
+  <div class="card">
+    <h2><span class="num">5</span>美化报告（从本地数据库生成）
+      <span id="db-meta" class="muted"></span></h2>
+    <div class="flex">
+      <button id="btn-report" onclick="genReport()">生成美化 Excel</button>
+      <span class="tip">💡<span class="tipbox">从本地 SQLite 读取全部查询快照（跨批次累积、去重取最新）。输出四个 Sheet：<ul><li><b>总览</b>：中文字段 + 数据条 + 色阶 + 商品/图片超链接</li><li><b>销量趋势(月)</b>：近18个月销量矩阵</li><li><b>原始数据</b>：129 字段全量</li><li><b>说明</b>：生成信息与指标口径</li></ul></span></span>
+      <a id="dl2" class="dl" style="display:none;" href="#">⬇ 下载美化报告</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><span class="num">6</span>广告分析（ads-insights 关键词历史）</h2>
+    <div class="flex">
+      <label>搜索量阈值 <input type="number" id="min-vol" value="500" min="0" step="100"></label>
+      <button onclick="importAds()">① 导入已下载文件</button>
+      <button id="btn-ads" onclick="genAdsReport()">② 广告分析报告（全部历史）</button>
+      <button id="btn-ads-cur" onclick="genAdsReport('current')">②⁺ 仅当前分析</button>
+      <button onclick="cleanAds()">③ 生成高相关词清单</button>
+      <span class="tip">💡<span class="tipbox"><ul><li><b>② 全部历史</b>：数据源 = ⚡自动抓取入库的广告词 + ①导入的导出文件（可选，放入 adv_reserach/ 后点①）。分页按"我分析的ASIN"一页一个分析对象，页内灰色区域标题标明每块词来自哪个竞品；归属不到任务的进"其他来源"页，导入种子词进"导入来源"页</li><li><b>②⁺ 仅当前分析</b>：只统计当前任务那批竞品的广告词（导入文件不混入），覆盖数/分层只在这批竞品内计算——适合看"这一轮分析能用哪些词"</li><li><b>③ 高相关词清单</b>：价值函数 v2 多因子加权——购买体量20% + 需求规模20% + 购买转化15% + 广告排名15% + 广告点击10% + 市场定价10% + 供需空间10%（批内归一，缺因子按中性值计，无品类经验）；品牌词（按本地库品牌表）单独分层，不剔除任何词</li></ul></span></span>
+      <a id="dl3" class="dl" style="display:none;" href="#">⬇ 下载广告报告</a>
+    </div>
+    <div class="flex" style="margin-top:10px;">
+      <label><input type="checkbox" id="ads-backfill"> 生成后自动补齐官方指标（全体保留词·后台执行，每100词约1-2分钟）</label>
+    </div>
+    <div class="muted" id="ads-report-prog" style="margin-top:6px;">② 尚未开始</div>
+    <hr style="border:none; border-top:1px solid var(--line); margin:14px 0;">
+    <div class="flex">
+      <label>竞品数 Top <input type="number" id="ads-limit" value="10" min="1" max="50"></label>
+      <label>按投放热度取前 <input type="number" id="ads-groups" value="4" min="1" max="38"> 个组</label>
+      <label>周预算 <input type="number" id="ads-weeks" value="3" min="1" max="27"> 周</label>
+      <button id="btn-ads-auto" onclick="startAdsAuto()">⚡ 自动抓取竞品广告（会员号执行）</button>
+    </div>
+    <div class="bar"><i id="ads-bar"></i></div>
+    <div class="muted" id="ads-prog">尚未开始</div>
+    <div id="ads-log" class="log" style="margin-top:10px; height:150px;">等待任务…（按第②④步产出的竞品月销量排序，逐个收割组结构+关键词）</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="num">7</span>关键词补齐（官方购买率/月购买量 · 主账号）</h2>
+    <div class="flex" style="flex-direction:column; align-items:stretch; gap:8px;">
+      <textarea id="kwminer-input" rows="4" style="width:100%; box-sizing:border-box; font-family:inherit;"
+        placeholder="每行一个关键词（逗号分隔也可以），自动按每批20词切分。例：&#10;portable power station&#10;solar generator for home"></textarea>
+      <div class="flex">
+        <button id="btn-kwminer" onclick="runKwMiner()">🔍 批量查询并入库（关键词挖掘·官方数据）</button>
+        <span class="tip">💡<span class="tipbox">数据源 = 卖家精灵"关键词挖掘-批量分析"接口（免费会员可用），官方 ARA 数据：<b>月购买量 / 购买率 / ABA排名 / 需供比 / 转化总占比 / 逐月趋势</b>。<ul><li><b>入库即生效</b>：重新生成②报告，官方值自动补上</li><li><b>②自动补齐</b>：在②勾选后，报告<b>全体保留词</b>自动走本链路（综合分降序，跳过已查过的词，后台执行、逐批入库）</li><li><b>账号池</b>：可添加多个主账号，每批(20词)自动轮换分摊，会话失效自动跳过</li><li><b>频控</b>：批间随机等待 3-6 秒不变；单次最多 100 词</li></ul></span></span>
+      </div>
+      <div class="flex" style="margin-top:10px;">
+        <span class="muted">主账号池（每批轮换分摊）：</span>
+        <span id="pool-list" class="flex" style="gap:8px;"></span>
+        <button class="ghost sm" onclick="poolAdd()">＋添加账号</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><span class="num">8</span>维护</h2>
+    <div class="flex">
+      <label>历史报告每类保留最近 <input type="number" id="clean-keep" value="3" min="0" max="50"> 份</label>
+      <button onclick="doCleanup()">🧹 清理历史文件（报告+调试转储）</button>
+      <span class="tip">💡<span class="tipbox"><ul><li><b>清理</b>：deep_results/ 下的历史 Excel 报告（美化报告/广告报告/高相关词清单/原始导出，每类保留最近 N 份）；ads_debug/ 与 lookup_debug/ 的接口调试转储；debug_cl 现场截图</li><li><b>保留不动</b>：deepdive.db 数据库、asins_*.json（报告分页依赖的"我分析的ASIN"映射）、登录态、配置</li></ul></span></span>
+    </div>
+  </div>
+
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let selectedTask = null, jobId = null, pollTimer = null;
+let clJobId = null, clTimer = null;
+
+function toast(msg, ms = 2600) {
+  const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', ms);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.detail || r.statusText); }
+  return r.json();
+}
+function badge(el, loggedIn, text) {
+  el.className = 'badge ' + (loggedIn ? 'ok' : 'no');
+  el.textContent = text || (loggedIn ? '已登录' : '未登录');
+}
+
+async function refreshAccounts() {
+  try {
+    const a = await api('/api/accounts');
+    for (const role of ['main', 'member']) {
+      const info = a[role] || {};
+      const el = role === 'main' ? 'main' : 'member';
+      badge($(el + '-badge'), info.logged_in, info.logged_in ? (info.memberLevel === 'G' ? '会员' : info.memberLevel) : '未登录');
+      $(el + '-nick').textContent = info.logged_in ? info.nickname : '-';
+      $(el + '-sub').textContent = info.logged_in ? `会员等级 ${info.memberLevel} · ${info.expired} 到期` : '尚未保存登录态';
+    }
+    badge($('probe-badge'), !!a.lookup_cfg, a.lookup_cfg ? '接口已探测' : '接口未探测');
+    $('db-meta').textContent = a.db ? `本地库: ${a.db.snapshots} 条快照 · ${a.db.asins} 个ASIN · ${a.db.batches} 个批次` : '';
+  } catch (e) { toast('账号状态获取失败: ' + e.message); }
+}
+
+async function genReport() {
+  const btn = $('btn-report');
+  btn.disabled = true; btn.textContent = '生成中…';
+  try {
+    const r = await api('/api/report', { method: 'POST' });
+    $('dl2').style.display = 'inline';
+    $('dl2').href = '/api/report/download';
+    $('dl2').textContent = `⬇ 下载美化报告（${r.count} 个产品）`;
+    toast('✅ 美化报告已生成');
+  } catch (e) { toast(e.message); }
+  btn.disabled = false; btn.textContent = '生成美化 Excel';
+}
+
+/* ---------- ① AI 找竞品提交 ---------- */
+function fillSel(sel, items) {
+  if (!items || !items.length) return;   // 空选项不覆盖现有内容
+  sel.innerHTML = '<option value="">页面默认</option>' +
+    (items || []).map(x => `<option>${x}</option>`).join('');
+}
+async function loadClOptions() {
+  try {
+    const r = await api('/api/cl/options');
+    fillSel($('cl-site'), r.site); fillSel($('cl-count'), r.count);
+    toast(r.note || '✅ 已读取页面下拉框可选值', 3500);
+  } catch (e) { toast('读取选项失败: ' + e.message); }
+}
+async function startCl() {
+  const raw = $('cl-asins').value.trim();
+  if (!raw) return toast('请输入 ASIN');
+  const btn = $('btn-cl');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/cl/submit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ asins: raw, site: $('cl-site').value,
+                             count: $('cl-count').value, auto_extract: $('cl-auto').checked })
+    });
+    clJobId = r.job_id;
+    if (clTimer) clearInterval(clTimer);
+    clTimer = setInterval(pollCl, 2000);
+  } catch (e) { toast(e.message); btn.disabled = false; }
+}
+async function pollCl() {
+  if (!clJobId) return;
+  try {
+    const j = await api(`/api/job/${clJobId}`);
+    $('cl-bar').style.width = (j.total ? Math.round(j.done / j.total * 100) : 0) + '%';
+    const nt = (j.task_ids || []).length;
+    $('cl-prog').textContent = `进度 ${j.done}/${j.total} · 已完成任务 ${nt} 个 · 状态 ${j.status}`;
+    $('cl-log').textContent = (j.log || []).join('\n');
+    $('cl-log').scrollTop = $('cl-log').scrollHeight;
+    if (j.status !== 'running') {
+      clearInterval(clTimer); clTimer = null;
+      $('btn-cl').disabled = false;
+      loadHistory(); refreshAccounts();
+      if (j.status === 'done') {
+        toast('🎉 AI 找竞品完成');
+        if (nt > 0) {  // 已有任务产出，允许直接进入后续步骤
+          $('btn-lookup').disabled = false;
+          $('asins-meta').textContent = '已由步骤①自动提取（详见上方日志），可直接执行步骤④';
+        }
+      } else toast('提交未成功，查看日志');
+    }
+  } catch (e) { clearInterval(clTimer); clTimer = null; $('btn-cl').disabled = false; toast('轮询失败: ' + e.message); }
+}
+
+async function login(role, confirm) {
+  try {
+    if (!confirm) {
+      await api(`/api/login/${role}`, { method: 'POST' });
+      toast('登录窗口已打开，请在弹出的浏览器中登录');
+      return;
+    }
+    const r = await api(`/api/login/${role}/confirm`, { method: 'POST' });
+    if (r.ok) { toast('✅ ' + r.message); refreshAccounts(); }
+    else toast('⚠ ' + r.message);
+  } catch (e) { toast(e.message); }
+}
+
+async function loadHistory() {
+  $('his-body').innerHTML = '<tr><td colspan="7" class="muted">加载中…</td></tr>';
+  try {
+    const r = await api('/api/history');
+    $('his-meta').textContent = `API ${r.api_count} 条 · 页面元素 ${r.dom_count} 条 · DOM 补充 ${r.dom_extra} 条 · 合计 ${r.tasks.length} 条`;
+    const tb = $('his-body'); tb.innerHTML = '';
+    r.tasks.forEach((t, i) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td><input type="radio" name="task"></td>
+        <td class="st-${t.taskStatus}">${t.taskStatus}</td><td>${t.createdTime}</td>
+        <td>${t.market}</td><td><b>${t.asin}</b></td>
+        <td class="muted">${t.taskId.slice(0, 12)}…</td><td class="muted">${t.source}</td>`;
+      tr.onclick = () => {
+        document.querySelectorAll('#his-body tr').forEach(x => x.classList.remove('sel'));
+        tr.classList.add('sel'); selectedTask = t.taskId;
+        $('btn-extract').disabled = false;
+      };
+      tb.appendChild(tr);
+    });
+    if (!r.tasks.length) tb.innerHTML = '<tr><td colspan="7" class="muted">没有历史任务</td></tr>';
+  } catch (e) { $('his-body').innerHTML = `<tr><td colspan="7" style="color:var(--red)">加载失败: ${e.message}</td></tr>`; }
+}
+
+async function extractAsins() {
+  if (!selectedTask) return toast('请先在表格中选择一个任务');
+  $('btn-extract').disabled = true;
+  try {
+    const r = await api(`/api/task/${selectedTask}/asins`);
+    $('asins-meta').textContent = `任务 ${r.taskId.slice(0, 12)}… · 共 ${r.count} 个竞品 ASIN（AI标注 ${r.ai_rows_saved} 条已留存）`;
+    const pv = $('asins-preview');
+    pv.style.display = 'block';
+    pv.textContent = r.preview.join('  ') + (r.count > r.preview.length ? `  …共 ${r.count} 个` : '');
+    $('btn-lookup').disabled = false;
+    jobId = null; $('dl').style.display = 'none';
+    toast(`✅ 提取到 ${r.count} 个 ASIN`);
+  } catch (e) { toast('提取失败: ' + e.message); }
+  $('btn-extract').disabled = false;
+}
+
+async function startLookup() {
+  try {
+    const r = await api('/api/lookup', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chunk: parseInt($('chunk').value) || 20 })
+    });
+    jobId = r.job_id;
+    $('btn-lookup').disabled = true;
+    $('log').textContent = '';
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(pollJob, 1500);
+  } catch (e) { toast(e.message); }
+}
+
+async function pollJob() {
+  if (!jobId) return;
+  try {
+    const j = await api(`/api/job/${jobId}`);
+    $('bar').style.width = (j.total ? Math.round(j.done / j.total * 100) : 0) + '%';
+    $('prog-text').textContent = `进度 ${j.done}/${j.total} · 已获 ${j.rows} 行 · 状态 ${j.status}`;
+    $('log').textContent = (j.log || []).join('\n');
+    $('log').scrollTop = $('log').scrollHeight;
+    if (j.status !== 'running') {
+      clearInterval(pollTimer); pollTimer = null;
+      $('btn-lookup').disabled = false;
+      refreshAccounts();
+      if (j.status === 'done' && j.xlsx) {
+        $('dl').style.display = 'inline';
+        $('dl').href = `/api/job/${jobId}/download`;
+        toast('🎉 全部完成，可下载 Excel');
+      } else toast('查询结束但没有数据，查看日志');
+    }
+  } catch (e) { clearInterval(pollTimer); toast('轮询失败: ' + e.message); $('btn-lookup').disabled = false; }
+}
+
+/* ---------- ⑥ 广告分析 ---------- */
+async function cleanAds() {
+  try {
+    const r = await api('/api/ads/clean', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}) });
+    $('dl3').style.display = 'inline';
+    $('dl3').href = '/api/report/download';
+    $('dl3').textContent = `⬇ 下载高相关词清单（${r.kept}/${r.total} 词）`;
+    toast(`✅ 保留 ${r.kept} 词（品牌词 ${r.brand} / 标准 ${r.standard}）/ 总 ${r.total}`, 3500);
+  } catch (e) { toast(e.message); }
+}
+
+async function importAds() {
+  try {
+    const r = await api('/api/ads/import', { method: 'POST' });
+    let msg = `✅ 导入 ${r.files} 个文件 / ${r.rows} 行`;
+    if (r.errors && r.errors.length) msg += `（${r.errors.length} 个失败）`;
+    toast(msg); refreshAccounts();
+  } catch (e) { toast(e.message); }
+}
+let adsReportJobId = null, adsReportTimer = null;
+async function genAdsReport(scope) {
+  const doBf = $('ads-backfill') && $('ads-backfill').checked;
+  try {
+    const r = await api('/api/ads/report', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ min_vol: parseInt($('min-vol').value) || 500,
+                             scope: scope || 'all',
+                             backfill: doBf })
+    });
+    adsReportJobId = r.job_id;
+    $('btn-ads').disabled = true; $('btn-ads-cur').disabled = true;
+    if (adsReportTimer) clearInterval(adsReportTimer);
+    adsReportTimer = setInterval(pollAdsReport, 2000);
+    pollAdsReport();
+  } catch (e) { toast(e.message); }
+}
+async function pollAdsReport() {
+  if (!adsReportJobId) return;
+  try {
+    const j = await api(`/api/job/${adsReportJobId}`);
+    let prog = `${j.phase || '—'}`;
+    if (j.total) prog += ` · ${j.done}/${j.total} 批`;
+    if (j.detail) prog += ` · ${j.detail}`;
+    prog += ` · ${j.pct || 0}% · ${j.status}`;
+    $('ads-report-prog').textContent = prog;
+    if (j.status !== 'running') {
+      clearInterval(adsReportTimer); adsReportTimer = null; adsReportJobId = null;
+      $('btn-ads').disabled = false; $('btn-ads-cur').disabled = false;
+      refreshAccounts();
+      if (j.status === 'done' && j.result) {
+        const r = j.result;
+        $('dl3').style.display = 'inline';
+        $('dl3').href = '/api/report/download';
+        $('dl3').textContent = `⬇ 下载广告报告（保留 ${r.kept} / 共 ${r.total_kw} 词）`;
+        let msg = `✅ 保留 ${r.kept} 词，过滤 ${r.dropped} 词（⚡抓取 ${r.harvest_asins} 竞品 + ①导入 ${r.imported_sources} 来源）`;
+        if (r.backfill) {
+          const b = r.backfill;
+          msg += ` | 补齐: 候选 ${b.candidates} · 已查过 ${b.already_have} · 查询 ${b.todo} 词 · 入库 ${b.saved} 行`;
+          if (b.error) msg += `（中断: ${b.error}）`;
+        }
+        toast(msg, 6000);
+      } else {
+        const errLine = (j.log || []).filter(l => l.startsWith('[x]')).pop() || '原因见服务日志';
+        toast(`❌ 报告生成失败: ${errLine}`, 5000);
+      }
+    }
+  } catch (e) {
+    clearInterval(adsReportTimer); adsReportTimer = null; adsReportJobId = null;
+    $('btn-ads').disabled = false; $('btn-ads-cur').disabled = false;
+    toast('轮询失败: ' + e.message);
+  }
+}
+
+/* ---------- ⑦ 主账号池 ---------- */
+async function loadPool() {
+  try {
+    const r = await api('/api/pool');
+    const el = $('pool-list');
+    el.innerHTML = r.slots.map(s => {
+      let st = '<span class="muted">未登录</span>';
+      if (s.pending && !s.exists) st = '<span style="color:var(--yellow);font-weight:600;">等待完成登录</span>';
+      else if (s.dead) st = '<span style="color:var(--red);">已失效</span>';
+      else if (s.exists) st = '<span style="color:var(--green);">已登录</span>';
+      const extra = s.pending
+        ? `<button class="ghost sm" onclick="poolCancel(${s.slot})">取消</button>`
+        : `<button class="ghost sm" onclick="poolRemove(${s.slot})">移除</button>`;
+      return `<span class="pool-chip">池${s.slot} ${st}
+        <button class="ghost sm" onclick="poolWin(${s.slot})">窗口</button>
+        <button class="ghost sm" onclick="poolOk(${s.slot})">完成</button>
+        ${extra}</span>`;
+    }).join('') || '<span class="muted">空（点＋添加账号）</span>';
+    el.dataset.next = r.next_slot;
+  } catch (e) { toast('账号池状态获取失败: ' + e.message); }
+}
+async function poolCancel(slot) {
+  try { await api(`/api/login/pool${slot}/cancel`, { method: 'POST' }); loadPool(); }
+  catch (e) { toast(e.message); }
+}
+async function poolWin(slot) {
+  try { await api(`/api/login/pool${slot}`, { method: 'POST' });
+        toast(`池${slot} 登录窗口已打开，完成登录后点“完成”`); } catch (e) { toast(e.message); }
+}
+async function poolOk(slot) {
+  try {
+    const r = await api(`/api/login/pool${slot}/confirm`, { method: 'POST' });
+    toast(r.ok ? `✅ 池${slot} 已入池：${r.account.nickname}` : r.message, 3500);
+    loadPool();
+  } catch (e) { toast(e.message); }
+}
+async function poolRemove(slot) {
+  try { await api(`/api/pool/remove/${slot}`, { method: 'POST' }); loadPool(); }
+  catch (e) { toast(e.message); }
+}
+async function poolAdd() {
+  try {
+    const r = await api('/api/pool');
+    await api(`/api/login/pool${r.next_slot}`, { method: 'POST' });
+    toast(`池${r.next_slot} 登录窗口已打开，完成登录后回来到该槽位点“完成”`);
+    loadPool();
+  } catch (e) { toast(e.message); }
+}
+
+async function runKwMiner() {
+  const btn = $('btn-kwminer');
+  btn.disabled = true; btn.textContent = '查询中…（每批间隔3-6秒）';
+  try {
+    const r = await api('/api/kwminer', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keywords: $('kwminer-input').value, market: 'US' }) });
+    let msg = `✅ ${r.batches} 批 / 请求 ${r.keywords} 词 / 返回 ${r.got} 词 / 入库 ${r.saved} 行`;
+    if (r.missing && r.missing.length) msg += `（未返回: ${r.missing.join('、')}）`;
+    toast(msg + ' —— 重新生成②报告即自动补齐官方指标', 5000);
+    refreshAccounts();
+  } catch (e) { toast(e.message); }
+  btn.disabled = false; btn.textContent = '🔍 批量查询并入库（关键词挖掘·官方数据）';
+}
+
+async function doCleanup() {
+  const keep = parseInt($('clean-keep').value);
+  if (!confirm(`将删除历史 Excel 报告（每类保留最近 ${isNaN(keep) ? 3 : keep} 份）和全部调试转储/截图文件，确定？`)) return;
+  try {
+    const r = await api('/api/cleanup', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keep_reports: isNaN(keep) ? 3 : keep })
+    });
+    const d = r.detail || {};
+    toast(`🧹 已清理 ${r.files} 个文件，释放 ${r.freed_mb} MB（旧报告 ${d['旧报告'] || 0} · 调试转储 ${d['调试转储'] || 0} · 截图 ${d['截图'] || 0}）`, 4500);
+  } catch (e) { toast(e.message); }
+}
+
+/* ---------- ⑥-B 自动抓取 ---------- */
+let adsJobId = null, adsTimer = null;
+async function startAdsAuto() {
+  try {
+    const r = await api('/api/ads/auto', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit: parseInt($('ads-limit').value) || 10,
+                             top_groups: parseInt($('ads-groups').value) || 4,
+                             weeks_budget: parseInt($('ads-weeks').value) || 3 })
+    });
+    adsJobId = r.job_id;
+    $('btn-ads-auto').disabled = true;
+    if (adsTimer) clearInterval(adsTimer);
+    adsTimer = setInterval(pollAds, 2000);
+  } catch (e) { toast(e.message); }
+}
+async function pollAds() {
+  if (!adsJobId) return;
+  try {
+    const j = await api(`/api/job/${adsJobId}`);
+    const pct = (typeof j.pct === 'number') ? j.pct
+              : (j.total ? Math.round(j.done / j.total * 100) : 0);
+    $('ads-bar').style.width = pct + '%';
+    let prog = '';
+    if (j.status === 'running' && j.plan) {
+      prog += `计划 ${j.plan.asins} 竞品 / ${j.plan.groups} 组 / 每组≤${j.plan.weeks_budget} 周 ≈ ≤${j.plan.est_calls} 次调用 · `;
+    }
+    prog += `阶段 ${j.phase || '—'}`;
+    if (j.detail) prog += ` · ${j.detail}`;
+    prog += ` · 已完成竞品 ${j.done}/${j.total} · ${pct}% · 状态 ${j.status}`;
+    $('ads-prog').textContent = prog;
+    $('ads-log').textContent = (j.log || []).join('\n');
+    $('ads-log').scrollTop = $('ads-log').scrollHeight;
+    if (j.status !== 'running') {
+      clearInterval(adsTimer); adsTimer = null;
+      $('btn-ads-auto').disabled = false;
+      refreshAccounts();
+      toast(j.status === 'done' ? '🎉 广告抓取完成，可直接点“② 生成广告分析报告”（数据已入库）' : '抓取结束（有错误，看日志）');
+    }
+  } catch (e) { clearInterval(adsTimer); adsTimer = null; $('btn-ads-auto').disabled = false; toast('轮询失败: ' + e.message); }
+}
+
+refreshAccounts();
+loadPool();
+</script>
+</body>
+</html>

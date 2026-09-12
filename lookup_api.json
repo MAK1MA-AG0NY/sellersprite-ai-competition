@@ -1,0 +1,40 @@
+{
+ "method": "POST",
+ "url": "/v3/api/competing-lookup",
+ "post_data": {
+  "market": "US",
+  "monthName": "bsr_sales_nearly",
+  "asins": [
+   "B07F8S18D5",
+   "B08DTZM7LM",
+   "B0GFWHXF5R",
+   "B0CLB3SCK5",
+   "B0CJ6NZWZ9",
+   "B0744DM3Y3",
+   "B0BRN58CXR",
+   "B0CGWGVPTG",
+   "B0C37P1YXH",
+   "B07H878J9Z",
+   "B09MCKK9NX",
+   "B0949DWJCV",
+   "B08RJJDW52",
+   "B0DP42G526",
+   "B088H1YDS1",
+   "B0CQK5FQVR",
+   "B09WXBZC9H",
+   "B08KZMTWRK",
+   "B08B3NHBJ4",
+   "B09BF6NX4L"
+  ],
+  "page": 1,
+  "nodeIdPaths": [],
+  "symbolFlag": false,
+  "size": 60,
+  "order": {
+   "field": "amz_unit",
+   "desc": true
+  },
+  "lowPrice": "N"
+ },
+ "discovered_at": "2026-09-08T16:20:57"
+}

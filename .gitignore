@@ -1,0 +1,61 @@
+# ============================================================
+#  安全第一：登录态 / Cookie —— 绝对不要提交
+#  storage_state*.json 里是卖家精灵账号的完整 cookie，
+#  一旦入库等于公开账号，请勿外传。
+# ============================================================
+storage_state.json
+storage_state_member.json
+storage_state*.json
+states/
+*.state.json
+
+# ============================================================
+#  环境与依赖（可重建，体积大，不入库）
+# ============================================================
+.venv/
+.venv*/
+.uv-cache/
+.pw-browsers/
+.pw-tmp/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.codegraph/
+
+# ============================================================
+#  运行产物 / 本地数据库 / 业务数据
+# ============================================================
+deep_results/
+results/
+ads_debug/
+lookup_debug/
+kw_miner_debug/
+debug_responses/
+AI_find_enemy_result/
+adv_reserach/
+搭建资源/
+*.db
+*.sqlite3
+*.xlsx
+*.xls
+
+# ============================================================
+#  一次性调试 / 抓包 dump（接口探测期的临时文件）
+# ============================================================
+captured_responses.json
+ai_analysis_traffic.json
+aux_bodies.json
+cl_options.json
+content_head.txt
+poll_sample.json
+task_detail.json
+result_overview.json
+
+# ============================================================
+#  编辑器 / 系统
+# ============================================================
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.log
