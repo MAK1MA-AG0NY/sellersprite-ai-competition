@@ -20,13 +20,19 @@
 ⑤ 生成美化 Excel   总览 / 销量趋势矩阵 / 原始数据 / 说明 四个 sheet
 ```
 
-除主链路外还有三个扩展模块：
+除主链路外还有以下扩展模块：
 
 | 模块 | 说明 |
 |---|---|
 | **广告洞察** | 解析 `KeywordHistory-*.xlsx`（ABA 排名、月搜索量、购买率、PPC 价格等），并提供「搜索量阈值 + 打分 + 分层标签」的漏斗筛选 |
 | **关键词挖掘** | kw-miner 接口探测与批量关键词分析 |
 | **本地快照库** | 每次查询按批次留档，`latest(asins)` 可取每个 ASIN 最近一次快照，支持跨批次对比 |
+| **监控名单（watchlist）** | 维护关注 ASIN 清单，支持免登录的 Amazon 端 BSR 抓取，以及 API / 探测两条通道刷新卖家精灵数据 |
+| **类目 BSR 榜** | 按品类（便携电站 / 太阳能板 / 户外三防手机）拉取类目 BSR Top-N 榜单并分配入库；榜单接口配置由 `bsr/probe` 在真实浏览器中捕获后缓存复用 |
+| **每日例行（routine）** | 按星期编排的自动化流水线：监控名单快照 + 官方指标补齐 + CL 找竞品（周一到周五各配一个种子 ASIN，周五用于新品类探边），一键 `routine/run` 跑完整链路 |
+| **HTML 报告** | 自包含单文件决策视图：统计卡片 + 销量趋势图 + 可排序 / 筛选 / 缩略图表格（xlsx 仍负责原始字段与后续计算） |
+| **AI 分析包** | 预聚合的紧凑 Markdown（产品层 Top N + 关键词层 Top M），可直接粘贴给外部 AI 做分析 |
+| **风格报告** | 输出 `*_style_*.xlsx`，用于对标竞品 listing 风格 |
 
 ---
 
@@ -55,12 +61,26 @@ sellersprite-ai-competition/
 ### 模块依赖关系
 
 ```
-web_server.py  ──┬── sellersprite_deep_dive.py   （历史 / 查询 / 导出）
+web_server.py  ──┬── sellersprite_deep_dive.py   （历史 / 查询 / 导出 / BSR 抓取）
                  ├── sellersprite_ai_report.py   （页面下拉框操作：detect_selects / set_select）
-                 ├── local_db.py                 （SQLite 快照）
-                 ├── make_report.py              （Excel 美化）
+                 ├── local_db.py                 （SQLite 快照 + 广告/关键词库）
+                 ├── make_report.py              （Excel / HTML / AI包 生成）
                  └── ads_insights.py             （广告洞察）
 ```
+
+### 运行时数据目录（**不入库**）
+
+程序运行时会在项目内生成以下目录与文件，它们由 `.gitignore` 整体拦截，clone 后会自动重建：
+
+| 路径 | 内容 |
+|---|---|
+| `deep_results/` | 运行产物总目录：`deepdive.db`、导出的 xlsx / html / md 报告、`watchlist.json`（监控名单）、`routine.json`（例行编排配置）、`bsr_api.json`（BSR 接口配置缓存）、`asins_*.json` |
+| `lookup_debug/` | 竞品查询与 BSR 探测的原始响应留档 |
+| `ads_debug/` | 广告洞察流程抓包 |
+| `states/` | 分账号登录态快照 |
+| `*.db` | 本地 SQLite 数据库（可能有数百 MB） |
+
+> 这些目录里的 `watchlist.json` / `routine.json` 属于**个人业务配置**，需要迁移时请手动复制，不要提交到仓库。
 
 ---
 

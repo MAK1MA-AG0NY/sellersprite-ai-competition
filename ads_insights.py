@@ -170,9 +170,12 @@ def funnel(rows_by_source, min_vol=500, brands=None, enrich_rows=None):
       rows_by_source: [{source, market, rows:[关键词×月份]}]（多来源=多竞品/多种子）
       brands: 品牌词表（用于识别品牌防御词，如 'anker'）；命中则分层为'品牌词'
       enrich_rows: [关键词×月份行] 指标补位来源（如关键词挖掘官方数据）——
-                   逐字段合并进同月行，但**不计入覆盖来源数**（不影响分层/综合分）
+                   仅为**已有广告/导入来源**的词逐字段补位进同月行，
+                   不计入覆盖来源数（不影响分层/综合分），也**不引入新词**
+                   （kw_miner 独有的词不进漏斗，避免空来源幽灵词）
     返回 {
-      kept: [聚合后的词行 + _sources + _coverage + _score + _tier],
+      kept: [聚合后的词行 + _sources + _coverage + _ranks(逐竞品广告排名) + 广告排名
+             + _score + _tier]，指标为词级市场口径（见列名标注），
       dropped: n, total_kw: n
     }
     """
@@ -191,17 +194,27 @@ def funnel(rows_by_source, min_vol=500, brands=None, enrich_rows=None):
                     prev[k] = v
 
     for src in rows_by_source:
+        src_name = str(src.get("source") or src.get("source_asin") or "?")
         for r in src.get("rows", []):
             kw = r["keyword"]
             e = kw_map.setdefault(kw, {"months": {}, "sources": set(), "market": src.get("market", "")})
-            e["sources"].add(src.get("source") or src.get("source_asin") or "?")
+            e["sources"].add(src_name)
             _merge(e, r)
+            # ASIN 级信号：保留每个来源 ASIN 在该词下的最佳广告排名（数值越小越靠前）
+            rk = r.get("广告排名")
+            if isinstance(rk, (int, float)):
+                ranks = e.setdefault("_ranks", {})
+                if ranks.get(src_name) is None or rk < ranks[src_name]:
+                    ranks[src_name] = int(rk)
     for r in enrich_rows or []:
         kw = r.get("keyword")
         if not kw:
             continue
-        e = kw_map.setdefault(kw, {"months": {}, "sources": set(), "market": ""})
-        _merge(e, r)   # 只补指标，不加 sources
+        if kw not in kw_map:
+            continue   # ⚠️ 不引入新词：enrich 只为已有广告/导入来源的词补位官方指标，
+                       # 否则 kw_miner 独有的词（历史补齐/手动查询残留）会以空来源
+                       # 混进报告（实测占比可达 55%）
+        _merge(kw_map[kw], r)   # 只补指标，不加 sources
 
     kept, dropped, aggs = 0, 0, []
     import math
@@ -216,6 +229,9 @@ def funnel(rows_by_source, min_vol=500, brands=None, enrich_rows=None):
         coverage = len(e["sources"])
         a["_sources"] = sorted(e["sources"])
         a["_coverage"] = coverage
+        # ASIN 级：逐竞品广告排名明细 + 最佳排名（None=无 spRank 数据，如纯导入文件来源）
+        a["_ranks"] = dict(e.get("_ranks") or {})
+        a["广告排名"] = min(a["_ranks"].values()) if a["_ranks"] else None
         a["_is_brand"] = any(b in kw.lower() for b in brands)
         # 综合分：对数化搜索量（防品牌巨词支配）× 覆盖热度 × 供给稀缺
         supply = min(a["需供比"] or 1, 10)
@@ -236,8 +252,11 @@ def funnel(rows_by_source, min_vol=500, brands=None, enrich_rows=None):
 
 
 # ---------- 2.5) 广告词价值排序（通用工具，不掺品类经验） ----------
-# 判定一律交给 value_top 的价值函数（点击/广告排名/搜索量/bid 四因子）；
+# 判定一律交给 value_top 的价值函数（多因子加权）；
 # 品牌词标记使用本地库 brand 字段（数据驱动，任何品类通用）。
+# ⚠️ 口径：因子分两类 —— ASIN级（广告验证·排名）与 词级市场级（其余全部）。
+# 词级市场因子衡量"这个词本身的市场价值"，与来源竞品无关；
+# ASIN 级信号只有：该词出现在竞品广告组（=竞品投了它）+ 竞品广告在该词下的位次（spRank）。
 
 
 def _is_brand_word(r):
@@ -267,6 +286,8 @@ def relevance_filter(rows, min_searches=0, brands=None, official=None):
     广告词价值排序与清洗（通用版，价值函数 v2）。
       - 全量行交给 value_top 打价值分并排序（多因子，缺因子按中性值计）；
       - official: {keyword: 官方指标}，参与评分并随结果行输出；
+        ⚠️ official 与行内 searches/clicks/impressions 均为【词级市场数据】（ARA/关键词挖掘口径），
+        不代表来源 ASIN 在该词上的表现；ASIN 级信号 = 广告排名(spRank) + 来源归属。
       - min_searches 过滤低量词；
       - 品牌词分层 = 本地库品牌表命中 ∨ 点击Top3标题品牌特征自动检测（数据驱动），
         不剔除任何词。
@@ -275,14 +296,21 @@ def relevance_filter(rows, min_searches=0, brands=None, official=None):
     brands = [b.lower() for b in (brands or [])]
     official = official or {}
     rows = [r for r in rows if str(r.get("keyword") or "").strip()]
-    kept, stat = [], {"brand": 0, "standard": 0, "low_search": 0}
+    kept, stat = [], {"brand": 0, "standard": 0, "low_search": 0, "dup": 0}
     scored = value_top(rows, n=len(rows), official=official)
+    seen_keys = set()
     for score, r in scored:
         kw = str(r.get("keyword") or "").strip()
         searches = r.get("searches") if isinstance(r.get("searches"), (int, float)) else 0
         if searches < min_searches:
             stat["low_search"] += 1
             continue
+        # 同词同源去重：同一 ASIN 在不同周收割的快照只保留评分最高的一条
+        key = (kw.lower(), str(r.get("_asin") or r.get("asin") or ""))
+        if key in seen_keys:
+            stat["dup"] += 1
+            continue
+        seen_keys.add(key)
         is_brand = any(b and b in kw.lower() for b in brands) or _is_brand_word(r)
         o = r.get("_official") or {}
         kept.append({"keyword": kw,
@@ -316,14 +344,17 @@ def _latest_sp_rank(r):
 # 某词缺某因子时按中性值 0.5 计（分母固定为全权重）——不因缺数据被惩罚，
 # 也不会像"剩余权重归一"那样让稀疏数据行单因子拉满而霸占榜首；
 # 有官方 ARA 数据的词自动获得更完整的证据链，数据越全越能冲高。
+# ⚠️ 口径：仅"广告验证·排名"是 ASIN 级因子（竞品自己的广告位次）；
+# 其余全部是词级市场因子（衡量词本身的市场价值），与来源竞品无关。
 VALUE_WEIGHTS = {
-    "需求规模": 0.20,      # log(月搜索量)
-    "购买体量": 0.20,      # log(官方月购买量) —— 关键词挖掘/导入文件的 ARA 数据
-    "购买转化": 0.15,      # 官方购买率（越高的词越接近成交）
-    "广告验证·点击": 0.10,  # log(竞品广告点击量) —— 竞品真金白银投出来的
-    "广告验证·排名": 0.15,  # 竞品广告排名（越前越好，60名封顶）
-    "市场定价": 0.10,      # log(bid/exactPpc) —— 市场对这个词的定价
-    "供需空间": 0.10,      # 官方需供比(封顶10) 或 搜索量/商品数
+    "需求规模": 0.20,      # log(词级月搜索量) —— 市场级
+    "购买体量": 0.20,      # log(词级官方月购买量) —— 市场级 ARA
+    "购买转化": 0.15,      # 词级官方购买率（该词全市场成交倾向）—— 市场级，非竞品转化率
+    "市场点击热度": 0.10,  # log(词级市场点击量) —— 该词在亚马逊搜索结果获得的总点击（ARA 口径），
+                           # 不是竞品广告的点击量；ASIN 级验证只看"广告验证·排名"
+    "广告验证·排名": 0.15,  # 竞品 ASIN 广告在该词下的位次（spRank，唯一的 ASIN 级因子，60名封顶）
+    "市场定价": 0.10,      # log(bid/exactPpc) —— 词级市场 CPC
+    "供需空间": 0.10,      # 词级官方需供比(封顶10) 或 搜索量/商品数
 }
 
 
@@ -331,6 +362,8 @@ def value_top(items, n=10, official=None):
     """
     价值函数 v2：多因子加权打分并取前 n 个。
       official: {keyword(小写): {月购买量/购买率/需供比/...}} 官方指标（关键词挖掘/导入文件）。
+        ⚠️ official 与行内 searches/clicks/impressions 均为【词级市场数据】，
+        不代表来源 ASIN 在该词上的表现。
       每个因子在批内 min-max 归一（重尾取log，排名取反）；缺因子按中性值 0.5 计（不惩罚、不归一）。
     返回 [(score, item)] 降序。
     """
@@ -351,6 +384,7 @@ def value_top(items, n=10, official=None):
         return v if isinstance(v, (int, float)) and v > 0 else None
 
     def f_clicks(it):
+        # ⚠️ clicks 是词级市场点击量（该词总点击，ARA 口径），非竞品广告点击
         return _log(it.get("clicks"))
 
     def f_rank(it):
@@ -373,7 +407,7 @@ def value_top(items, n=10, official=None):
         ("需求规模", f_searches, False),
         ("购买体量", f_purchases, False),
         ("购买转化", f_purchase_rate, False),
-        ("广告验证·点击", f_clicks, False),
+        ("市场点击热度", f_clicks, False),
         ("广告验证·排名", f_rank, True),
         ("市场定价", f_bid, False),
         ("供需空间", f_supply, False),
@@ -440,6 +474,8 @@ def full_rows_to_funnel(grouped):
       adProducts→商品数；searches/adProducts→需供比(估算)；clicks/searches→点击总占比(估算)；
       cvsShareRate→转化总占比；trends 环比→搜索增长率(估算)。
     另按 trends 展开逐月趋势行（搜索量），供"近3月均值"与"搜索量趋势(月)"矩阵使用。
+    ASIN 级字段：广告排名 = 来源 ASIN 广告在该词下的位次（spRankHistory 最新值），
+    供 funnel 按来源 ASIN 保留（_ranks 逐竞品明细）。
     """
     out = []
     for g in grouped or []:
@@ -468,6 +504,7 @@ def full_rows_to_funnel(grouped):
                 "点击总占比": round(clicks / searches, 4) if searches and clicks else None,
                 "转化总占比": r.get("cvsShareRate"),
                 "搜索增长率": growth,
+                "广告排名": _latest_sp_rank(r),   # ASIN 级：该来源 ASIN 的广告位次
             })
             for m, s in trend_map.items():   # 逐月趋势行（只有搜索量）
                 rows.append({"keyword": kw, "month": m, "market": "", "月搜索量": s})
@@ -555,10 +592,15 @@ async def fetch_ads_groups(page, asin, market_id=1, months=6, interval="week"):
     纯 API 拉取一个 ASIN 的全部广告组（含每周 keywordsCount 时间线）。
     page 需已处于 sellersprite 同源页面（登录态任意）。
     每页原始响应都会落盘 ads_debug/xds_p{n}_<asin>.json 供诊断。
+    ⚠️ ASIN 归属约束：接口会连带返回"相关发散 ASIN"的广告组（如查电站会混进
+    充电头/耳机组的广告，引入 airpods 等噪声词）。这里只保留
+    group.asin == 查询 ASIN 的组，发散组计入 skippedGroups 丢弃不抓。
     """
     groups, page_num, meta = [], 1, {}
+    fetched, skipped = 0, 0
     dbg = HERE / "ads_debug"
     dbg.mkdir(exist_ok=True)
+    asin_u = str(asin).strip().upper()
     while True:
         url = (f"{XDS_STAT}?asin={asin}&market={market_id}&interval={interval}&desc=false"
                f"&pageNum={page_num}&pageSize=50&orderByEffectiveness=false"
@@ -571,21 +613,28 @@ async def fetch_ads_groups(page, asin, market_id=1, months=6, interval="week"):
             pass
         d = j.get("data") or {}
         gs = d.get("groups") or []
-        groups.extend(gs)
+        fetched += len(gs)
+        own = [g for g in gs if str(g.get("asin") or "").strip().upper() == asin_u]
+        skipped += len(gs) - len(own)
+        groups.extend(own)
         meta = {"adCount": d.get("adCount"), "campaignCount": d.get("campaignCount"),
                 "maxKeywordsCount": d.get("maxKeywordsCount")}
         if not gs:
             break
-        if meta["adCount"] and len(groups) >= meta["adCount"]:
+        if meta["adCount"] and fetched >= meta["adCount"]:
             break
         page_num += 1
         await asyncio.sleep(1)
-    return {"asin": asin, **meta, "groups": groups}
+    return {"asin": asin, **meta, "skippedGroups": skipped, "groups": groups}
 
 
 async def fetch_group_keywords(page, ad_id, begin_date, end_date,
-                               market_id=1, interval="week", page_size=50, max_pages=2):
-    """某广告组在某周的关键词列表（限 max_pages 页，避免全量翻页触发风控）。"""
+                               market_id=1, interval="week", page_size=50, max_pages=2,
+                               asin=None):
+    """某广告组在某周的关键词列表（限 max_pages 页，避免全量翻页触发风控）。
+    ⚠️ ASIN 归属约束（第二层）：组合/店铺型广告组即使归属目标 ASIN，组内也会混投
+    该卖家的其他产品（如电站 ASIN 的组里混进充电头/耳机词，每行的 asin 字段
+    = 该词实际投放的商品 ASIN）。传入 asin 时只保留行级 asin == 目标 ASIN 的关键词。"""
     items, page_num = [], 1
     while page_num <= max_pages:
         url = (f"{XDS_STAT}/keyword?adId={ad_id}&interval={interval}"
@@ -601,6 +650,9 @@ async def fetch_group_keywords(page, ad_id, begin_date, end_date,
             break
         page_num += 1
         await asyncio.sleep(1)
+    if asin:
+        asin_u = str(asin).strip().upper()
+        items = [it for it in items if str(it.get("asin") or "").strip().upper() == asin_u]
     return items
 
 
@@ -640,7 +692,7 @@ async def ads_full(page, asin, market_id=1, months=6, top_groups=None,
         seen = {}
         for wi, w in enumerate(weeks, 1):
             kws = await fetch_group_keywords(page, g["adId"], w["beginDate"],
-                                             w["endDate"], market_id, max_pages=2)
+                                             w["endDate"], market_id, max_pages=2, asin=asin)
             top = value_top(kws, 10)
             for _, k in top:
                 seen.setdefault(str(k.get("id") or k.get("keyword")), k)

@@ -13,7 +13,7 @@ import json
 import re
 import time
 import random
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import uvicorn
@@ -51,6 +51,8 @@ async def goto_panel(page, kind, timeout_ms=20000):
     url, sel = PANEL_TARGET[kind]
     for _ in range(2):
         await page.goto(url, wait_until="domcontentloaded")
+        if "/user/login" in page.url:   # 被踢到登录页 = 会话失效，fail-fast
+            raise RuntimeError("主账号登录态已失效——请在控制台重新登录主账号")
         try:
             await page.wait_for_selector(sel, state="visible", timeout=timeout_ms)
             return True
@@ -102,6 +104,22 @@ async def get_browser():
         S["browser"] = await pw.chromium.launch(headless=True)
     return S["browser"]
 
+async def _check_login(page, role):
+    """页面登录态快速校验：失效时关闭坏页面并抛出带指引的异常（fail-fast，避免后续 40s 超时）。"""
+    try:
+        r = await page.evaluate(sd.FETCH_GET, "/v3/api/client")
+    except Exception as e:
+        raise RuntimeError(f"{role}页面校验失败: {e}")
+    d = (r or {}).get("j") or {}
+    data = d.get("data")
+    if not isinstance(data, dict) or not data.get("id"):
+        try:
+            await page.context.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"{role}登录态已失效——请在控制台重新登录{role}后重试")
+
+
 async def get_main_page():
     if S["main_page"] is None:
         browser = await get_browser()
@@ -110,6 +128,7 @@ async def get_main_page():
         page = await ctx.new_page()
         await page.goto(f"{BASE}/v3/ai-history?module=CL", wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
+        await _check_login(page, "主账号")   # 失效则抛错，坏页面不缓存
         S["main_page"] = page
     return S["main_page"]
 
@@ -121,6 +140,7 @@ async def get_vip_page():
         page = await ctx.new_page()
         await page.goto(f"{BASE}/v3/competitor-lookup", wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
+        await _check_login(page, "会员账号")
         S["vip_page"] = page
     return S["vip_page"]
 
@@ -158,6 +178,13 @@ def fmt_account(d):
     exp_s = datetime.fromtimestamp(exp / 1000).strftime("%Y-%m-%d") if isinstance(exp, (int, float)) else "-"
     return {"nickname": d.get("nickname") or "-", "memberLevel": d.get("memberLevel") or "-",
             "expired": exp_s}
+
+
+def _scope_label(scope="current"):
+    """输出文件名的 [ASIN/ALL] 段：当前分析 → 我分析的ASIN（未知则 ASIN）；全局 → ALL。"""
+    if scope == "global":
+        return "ALL"
+    return (S.get("current_seed") or "ASIN").upper()
 
 # ---------- 登录 ----------
 
@@ -286,8 +313,13 @@ async def accounts():
 
 @app.get("/api/history")
 async def history():
-    page = await get_main_page()
-    tasks = await sd.fetch_history(page, pages=8)
+    try:
+        page = await get_main_page()
+        tasks = await sd.fetch_history(page, pages=8)
+    except Exception as e:
+        if any(x in str(e) for x in ("失效", "登陆", "登录")):
+            reset_ctx("main")   # 坏页面自愈：下次调用用存储的登录态重建
+        raise HTTPException(400, str(e))
     api_n = len(tasks)
     dom_tasks = await sd.dom_history(page)
     known = {t["taskId"] for t in tasks}
@@ -330,9 +362,12 @@ async def task_asins(task_id: str):
 
 async def run_lookup(job_id: str, chunk: int):
     job = S["jobs"][job_id]
-    page = await get_vip_page()
-    asins = S["asins"]
+    seen_in = set()
+    asins = [a for a in S["asins"] if not (a.strip().upper() in seen_in or seen_in.add(a.strip().upper()))]
+    if len(asins) < len(S["asins"]):
+        job["log"].append(f"[i] 输入去重: {len(S['asins'])} → {len(asins)} 个 ASIN")
     job["total"] = len(asins)
+    page = await get_vip_page()
     cfg = None
     if LOOKUP_CFG.exists():
         cfg = json.loads(LOOKUP_CFG.read_text(encoding="utf-8"))
@@ -355,8 +390,16 @@ async def run_lookup(job_id: str, chunk: int):
                     job["log"].append("[+] 接口已探测并保存到 lookup_api.json")
             for r in rows:
                 r["_batch_asins"] = ",".join(batch)
+            # 变体家族展开去重（数据端后处理）：同批内同一 ASIN 的代表行只保留一条
+            uniq = {}
+            for r in rows:
+                uniq.setdefault(str(r.get("asin") or "").strip().upper(), r)
+            dup_n = len(rows) - len(uniq)
+            rows = list(uniq.values())
+            if dup_n:
+                job["log"].append(f"[i] 变体展开去重: {len(rows) + dup_n} → {len(rows)} 行（移除 {dup_n} 行同 ASIN 重复）")
             all_rows.extend(rows)
-            got = {str(r.get("asin") or "").strip().upper() for r in rows}
+            got = set(uniq.keys())
             missing = [a for a in batch if a.upper() not in got]
             job["log"].append(f"[+] 本批返回 {len(rows)} 行（请求 {len(batch)} 个，缺数据 {len(missing)} 个）")
             if missing:
@@ -366,13 +409,14 @@ async def run_lookup(job_id: str, chunk: int):
         job["done"] = min(bi * chunk, len(asins))
         await asyncio.sleep(1.5)
     if all_rows:
-        fp = OUT_DIR / f"deep_dive_{(S['current_task'] or 'web')[:12]}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+        fp = OUT_DIR / f"{_scope_label('current')}_deepdive_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
         n, k = sd.export_excel(all_rows, fp)
         job["xlsx"] = str(fp)
         job["log"].append(f"[+] 导出完成: {fp.name} ({n} 行 x {k} 列)")
         try:
             local_db.save_batch(job_id, S["current_task"], len(asins), all_rows)
             S["last_rows"] = all_rows
+            S["last_rows_task"] = S["current_task"]   # 标记数据归属，供⑤"当前分析"范围校验
             job["log"].append("[+] 已写入本地数据库 deepdive.db（可在第4步生成美化报告）")
         except Exception as e:
             job["log"].append(f"[!] 本地数据库写入失败: {e}")
@@ -382,19 +426,27 @@ async def run_lookup(job_id: str, chunk: int):
 # ---------- AI 找竞品（CL 提交 + 轮询） ----------
 
 async def wait_cl_task(page, tid, job, timeout_s=900):
-    """轮询 CL 任务状态直到完成；返回最终状态或 None(超时)。"""
+    """轮询 CL 任务状态直到完成；返回最终状态或 None(超时)/"POLL_ERROR"(页面卡死)。
+    每次轮询强制 15s 超时——page.evaluate 本身无超时，页面卡死会永久挂起。"""
     path = f"/v3/api/ai-analysis/task/original/summary/{tid}"
-    t0 = time.time()
+    t0, last_log, err_streak = time.time(), -1, 0
     while time.time() - t0 < timeout_s:
         try:
-            j = await sd.api_get(page, path)
+            j = await asyncio.wait_for(sd.api_get(page, path), timeout=15)
+            err_streak = 0
             t = (j.get("data") or [{}])[0]
             st = t.get("taskStatus")
             if st and st != "SUBMITTED":
                 return st
-            job["log"][-1] = f"[+] 任务 {tid[:12]}… 分析中 {int(time.time() - t0)}s（预计5-8分钟）"
+            elapsed = int(time.time() - t0)
+            if elapsed - last_log >= 60:
+                job["log"].append(f"[+] 任务 {tid[:12]}… 分析中 {elapsed}s（预计5-8分钟）")
+                last_log = elapsed
         except Exception:
-            pass
+            err_streak += 1
+        if err_streak >= 8:   # 连续 ~2.5 分钟轮询失败/超时 = 页面卡死，不再干等
+            job["log"].append("[x] 轮询连续超时/失败（页面可能卡死），放弃等待该任务")
+            return "POLL_ERROR"
         await asyncio.sleep(5)
     return None
 
@@ -478,7 +530,11 @@ async def run_cl_job(job_id, asins, site, count, auto_extract):
     # 自动提取最后一个完成任务
     if auto_extract and done_tids:
         tid = done_tids[-1]
-        asins2, ai_rows = await sd.extract_asins(page, tid)
+        try:
+            asins2, ai_rows = await asyncio.wait_for(sd.extract_asins(page, tid), timeout=120)
+        except asyncio.TimeoutError:
+            job["log"].append("[!] 提取竞品超时（任务已完成，可稍后在历史任务里手动提取）")
+            asins2, ai_rows = [], []
         S["asins"], S["ai_rows"], S["current_task"] = asins2, ai_rows, tid
         OUT_DIR.mkdir(exist_ok=True)
         (OUT_DIR / f"asins_{tid[:12]}.json").write_text(
@@ -490,7 +546,6 @@ async def run_cl_job(job_id, asins, site, count, auto_extract):
 
 @app.get("/api/cl/options")
 async def cl_options():
-    page = await get_main_page()
     # 启动后首次先加载磁盘缓存
     if S.get("cl_options") is None and OPTS_FILE.exists():
         try:
@@ -498,8 +553,17 @@ async def cl_options():
         except Exception:
             pass
     cached = S.get("cl_options")
-    # 先确保停在提交面板（可能停在历史列表或进度面板）
-    panel_ok = await goto_panel(page, "submit")
+    # 页面获取 / 面板切换 fail-fast：会话失效立即返回明确原因（缓存兜底），不再傻等 40s 超时
+    try:
+        page = await get_main_page()
+        panel_ok = await goto_panel(page, "submit")
+    except Exception as e:
+        if any(x in str(e) for x in ("失效", "登陆", "登录")):
+            reset_ctx("main")   # 坏页面自愈：下次调用用存储的登录态重建
+        note = str(e)
+        if cached:
+            return {**cached, "note": note + "（本次为缓存值）"}
+        return {"site": [], "count": [], "note": note}
     if not panel_ok:
         if cached:
             return {**cached, "note": "提交面板未就位（可能被进行中任务占用），已使用缓存的选项"}
@@ -545,17 +609,720 @@ async def cl_submit(req: dict):
 
 @app.post("/api/lookup")
 async def lookup(req: dict):
+    # 手动 ASIN 模式：直接粘贴自有/零散 ASIN，查询并入本地库（批次归属 manual-<ts>）
+    manual = req.get("asins")
+    if manual:
+        raw = manual if isinstance(manual, str) else ",".join(str(x) for x in manual)
+        seen, manual_list = set(), []
+        for a in re.split(r"[,，\s]+", raw):
+            a = a.strip().upper()
+            if not a:
+                continue
+            if not re.fullmatch(r"[A-Z0-9]{10}", a):
+                raise HTTPException(400, f"ASIN 格式不对: {a}（应为 10 位字母数字，如 B0H4W51ZMH）")
+            if a not in seen:
+                seen.add(a)
+                manual_list.append(a)
+        if not manual_list:
+            raise HTTPException(400, "手动 ASIN 解析后为空")
+        S["asins"] = manual_list
+        S["current_task"] = f"manual-{datetime.now():%Y%m%d_%H%M%S}"
+        S["current_seed"] = None
+        S["current_market"] = "US"
     asins = S["asins"]
     if not asins:
-        raise HTTPException(400, "请先选择历史任务并提取 ASIN")
+        raise HTTPException(400, "请先选择历史任务并提取 ASIN，或在④卡片粘贴 ASIN 手动查询")
     chunk = int(req.get("chunk") or 20)
     if chunk <= 0:
         chunk = 20
     job_id = f"job{int(time.time() * 1000)}"
     S["jobs"][job_id] = {"status": "running", "log": [], "done": 0,
                          "total": len(asins), "rows": 0, "xlsx": None}
+    if manual:
+        S["jobs"][job_id]["log"].append(
+            f"[i] 手动 ASIN 模式：{len(asins)} 个（{S['current_task']}），查询后入库 deepdive.db")
     asyncio.create_task(run_lookup(job_id, chunk))
+    return {"job_id": job_id, "mode": "manual" if manual else "task",
+            "asins": len(asins), "label": S["current_task"]}
+
+# ---------- 监控名单（④ 例跑积累趋势：自家 ASIN + 类目 TOP10 + 手动补充） ----------
+
+WATCHLIST_FILE = OUT_DIR / "watchlist.json"
+BSR_CFG_FILE = OUT_DIR / "bsr_api.json"   # 类目BSR榜接口配置（probe 捕获），{类目名: cfg}
+DEFAULT_CATEGORIES = [
+    {"name": "便携电站", "tokens": ["power station", "solar generator"], "bsr_n": 50},
+    {"name": "太阳能板", "tokens": ["solar panel"], "bsr_n": 50},
+    {"name": "户外三防手机", "tokens": ["rugged phone"], "bsr_n": 50},
+]
+BSR_N_DEFAULT = 50   # 边际收益测算：41-50 名边际仍占 4-7%，51 名起降至 <5% 且逐段下滑
+
+
+def _load_bsr_cfg():
+    if BSR_CFG_FILE.exists():
+        try:
+            return json.loads(BSR_CFG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_bsr_cfg(cfg):
+    BSR_CFG_FILE.parent.mkdir(exist_ok=True)
+    BSR_CFG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _load_watchlist():
+    if WATCHLIST_FILE.exists():
+        try:
+            wl = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            wl = None
+        if isinstance(wl, dict):
+            wl.setdefault("manual", [])
+            wl.setdefault("categories", json.loads(json.dumps(DEFAULT_CATEGORIES)))
+            wl.setdefault("bsr_cache", {})
+            wl.setdefault("blocked", [])
+            for c in wl["categories"]:   # 旧文件迁移：补 bsr_n
+                c.setdefault("bsr_n", BSR_N_DEFAULT)
+            return wl
+    wl = json.loads(json.dumps(DEFAULT_CATEGORIES))
+    wl = {"manual": [], "categories": wl, "bsr_cache": {}}
+    WATCHLIST_FILE.parent.mkdir(exist_ok=True)
+    WATCHLIST_FILE.write_text(json.dumps(wl, ensure_ascii=False, indent=1), encoding="utf-8")
+    return wl
+
+
+def _save_watchlist(wl):
+    WATCHLIST_FILE.write_text(json.dumps(wl, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _own_source(title):
+    """自家 ASIN 细分来源：电站/太阳能板/手机/其他（便于按线屏蔽）。"""
+    t = str(title or "").lower()
+    if "solar panel" in t or "solar" in t and "panel" in t:
+        return "自家·太阳能板"
+    if "power station" in t or "generator" in t:
+        return "自家·电站"
+    if "phone" in t or "smartphone" in t or "mobile" in t:
+        return "自家·手机"
+    return "自家·其他"
+
+
+def _watchlist_all_items():
+    """全量名单（未应用屏蔽）：自家（按产品线细分）+ 类目榜 + 手动补充。"""
+    wl = _load_watchlist()
+    rows = local_db.latest()
+    own = [r for r in rows if "fossibot" in str(r.get("brand", "")).lower()]
+    own_set = {str(r.get("asin")).upper() for r in own}
+    items, seen = [], set()
+
+    def add(asin, source, note=""):
+        a = str(asin or "").strip().upper()
+        if a and re.fullmatch(r"[A-Z0-9]{10}", a) and a not in seen:
+            seen.add(a)
+            items.append({"asin": a, "source": source, "note": note})
+
+    for r in own:
+        add(r.get("asin"), _own_source(r.get("title")), str(r.get("title") or "")[:40])
+    cache = wl.get("bsr_cache") or {}
+    for cat in wl.get("categories", []):
+        name = cat.get("name") or "?"
+        n = int(cat.get("bsr_n") or BSR_N_DEFAULT)
+        live = cache.get(name) or {}
+        live_items = live.get("items") or []
+        if live.get("asins"):
+            for it in live_items:
+                add(it.get("asin"), f"BSR榜·{name}", str(it.get("title") or "")[:40])
+            continue
+        toks = [t.lower() for t in cat.get("tokens", []) if t]
+        cand = [r for r in rows
+                if str(r.get("asin")).upper() not in own_set
+                and any(t in str(r.get("title", "")).lower() for t in toks)]
+        cand.sort(key=lambda r: -(r.get("totalUnits") or 0))
+        for r in cand[:n]:
+            add(r.get("asin"), f"TOP·{name}", str(r.get("title") or "")[:40])
+    for m in wl.get("manual", []):
+        if isinstance(m, dict):
+            add(m.get("asin"), "手动", m.get("note") or "")
+        else:
+            add(m, "手动")
+    return items, len(own)
+
+
+def _watchlist_items():
+    """应用屏蔽后的名单（屏蔽的来源不参与④查询/例跑）。"""
+    wl = _load_watchlist()
+    blocked = set(wl.get("blocked") or [])
+    items, own_n = _watchlist_all_items()
+    own_active = len([i for i in items
+                      if i["source"] == "自家" or i["source"].startswith("自家·")])
+    items = [i for i in items if i["source"] not in blocked]
+    return items, own_active
+
+
+@app.get("/api/watchlist")
+async def watchlist_get():
+    bcfg = _load_bsr_cfg()
+    wl = _load_watchlist()
+    blocked = set(wl.get("blocked") or [])
+    all_items, own_n = _watchlist_all_items()
+    items = [i for i in all_items if i["source"] not in blocked]
+    bgroups = {}
+    for i in all_items:
+        if i["source"] in blocked:
+            bgroups[i["source"]] = bgroups.get(i["source"], 0) + 1
+    bsr = {name: (v.get("ts") or "") for name, v in (wl.get("bsr_cache") or {}).items()}
+    return {"count": len(items), "own": own_n, "items": items,
+            "categories": wl.get("categories", []),
+            "bsr_ts": bsr, "bsr_configured": sorted(bcfg.keys()),
+            "blocked": bgroups}
+
+
+@app.post("/api/watchlist/block")
+async def watchlist_block(req: dict):
+    """右键胶囊切换屏蔽：屏蔽的来源不参与④查询/例跑；再右键恢复。"""
+    source = str(req.get("source") or "").strip()
+    if not source:
+        raise HTTPException(400, "source 不能为空")
+    wl = _load_watchlist()
+    blocked = wl.setdefault("blocked", [])
+    if source in blocked:
+        blocked.remove(source)
+        state = False
+    else:
+        blocked.append(source)
+        state = True
+    _save_watchlist(wl)
+    return {"ok": True, "source": source, "blocked": state}
+
+
+@app.post("/api/watchlist/add")
+async def watchlist_add(req: dict):
+    raw = req.get("asins") or ""
+    note = str(req.get("note") or "").strip()
+    wl = _load_watchlist()
+    have = {str(m.get("asin") if isinstance(m, dict) else m).upper() for m in wl["manual"]}
+    added = 0
+    for a in re.split(r"[,，\s]+", str(raw)):
+        a = a.strip().upper()
+        if not a:
+            continue
+        if not re.fullmatch(r"[A-Z0-9]{10}", a):
+            raise HTTPException(400, f"ASIN 格式不对: {a}")
+        if a not in have:
+            wl["manual"].append({"asin": a, "note": note})
+            have.add(a)
+            added += 1
+    _save_watchlist(wl)
+    items, _ = _watchlist_items()
+    return {"ok": True, "added": added, "count": len(items)}
+
+
+@app.post("/api/watchlist/remove")
+async def watchlist_remove(req: dict):
+    asin = str(req.get("asin") or "").strip().upper()
+    wl = _load_watchlist()
+    n0 = len(wl["manual"])
+    wl["manual"] = [m for m in wl["manual"]
+                    if str(m.get("asin") if isinstance(m, dict) else m).upper() != asin]
+    _save_watchlist(wl)
+    return {"ok": True, "removed": n0 - len(wl["manual"]),
+            "note": "仅手动补充项可移除；自家/TOP10 项随库自动计算"}
+
+
+# ---------- 类目 BSR 实时榜（competitor-lookup 类目模式，非会员可查） ----------
+
+async def _bsr_refresh_all(job_log=None, only_category=None):
+    """按已捕获的接口配置，实时拉各类目 BSR 榜 Top bsr_n，写入 watchlist.json 缓存。"""
+    wl = _load_watchlist()
+    bcfg = _load_bsr_cfg()
+    cats = [c for c in wl.get("categories", [])
+            if (not only_category or c.get("name") == only_category) and bcfg.get(c.get("name"))]
+    if not cats:
+        msg = "没有可用的类目接口配置——先点「探测类目BSR接口」捕获一次"
+        if job_log:
+            job_log.append(f"[!] {msg}")
+        return {"ok": False, "note": msg, "summary": msg}
+    page = await get_main_page()
+    summary, cache = [], wl.setdefault("bsr_cache", {})
+    for c in cats:
+        name = c.get("name") or "?"
+        n = int(c.get("bsr_n") or BSR_N_DEFAULT)
+        try:
+            rows = await sd.bsr_fetch(page, bcfg[name], n)
+            items = [{"asin": str(r.get("asin")).upper(),
+                      "title": str(r.get("title") or "")[:80],
+                      "units": r.get("totalUnits") if isinstance(r.get("totalUnits"), (int, float)) else None}
+                     for r in rows]
+            cache[name] = {"ts": datetime.now().isoformat(timespec="seconds"),
+                           "asins": [i["asin"] for i in items], "items": items}
+            summary.append(f"{name} {len(items)}")
+            if job_log:
+                job_log.append(f"[+] BSR榜·{name}：实时获取 {len(items)} 个（前3: "
+                               f"{', '.join(i['asin'] for i in items[:3])}）")
+        except Exception as e:
+            summary.append(f"{name} 失败:{type(e).__name__}")
+            if job_log:
+                job_log.append(f"[x] BSR榜·{name} 获取失败: {type(e).__name__}: {e}")
+        await asyncio.sleep(1)
+    _save_watchlist(wl)
+    return {"ok": True, "summary": " / ".join(summary) or "无"}
+
+
+@app.post("/api/watchlist/bsr/probe")
+async def bsr_probe(req: dict = None):
+    """后台任务：打开【可见】浏览器（带已保存登录态）跑类目BSR捕获。
+    用户在窗口里像官网一样选类目→查询（可连续多个），关闭窗口或超时即结束。"""
+    seconds = int((req or {}).get("seconds") or 300)
+    state_file = STATE_FILE if STATE_FILE.exists() else (
+        MEMBER_STATE_FILE if MEMBER_STATE_FILE.exists() else None)
+    if state_file is None:
+        raise HTTPException(400, "没有已保存的登录态——请先在控制台登录主账号或会员账号")
+    job_id = f"bsr{int(time.time() * 1000)}"
+    S["jobs"][job_id] = {"status": "running", "log": [], "done": 0, "total": 0, "rows": 0,
+                         "xlsx": None, "type": "bsr_probe", "pct": 0, "detail": "正在打开可见窗口…"}
+    asyncio.create_task(run_bsr_probe(job_id, seconds, state_file))
     return {"job_id": job_id}
+
+
+async def run_bsr_probe(job_id: str, seconds: int, state_file):
+    job = S["jobs"][job_id]
+    browser = None
+    try:
+        pw = await get_pw()
+        browser = await pw.chromium.launch(headless=False)   # 捕获需要人工操作，必须可见
+        ctx = await browser.new_context(storage_state=str(state_file))
+        page2 = await ctx.new_page()
+        job["log"].append("[+] 可见窗口已打开：像官网一样选类目→查询，可连续查多个类目")
+        job["log"].append("[i] 操作完直接关闭该窗口即结束捕获；不关则最长 5 分钟自动收")
+        job["detail"] = "等待你在窗口里查询…"
+        results = await sd.probe_bsr_capture(page2, seconds=seconds)
+        if not results:
+            job["log"].append("[x] 未捕获到类目查询接口——至少完成一次类目查询再关窗口")
+            job["status"] = "error"
+            return
+        cfg = _load_bsr_cfg()
+        wl = _load_watchlist()
+        cat_names = [c.get("name") for c in wl.get("categories", [])]
+        auto_map = [("便携电站", ("generator", "power station", "portable power")),
+                    ("太阳能板", ("solar panel", "solar")),
+                    ("户外三防手机", ("cell phone", "phone", "mobile"))]
+        for k in [k for k in cfg if k.startswith("capture")]:
+            del cfg[k]   # 清理旧版未解析标签的脏键
+        out = []
+        for r in results:
+            entry = {k: r[k] for k in ("method", "url", "post_data", "captured_at")}
+            lab = r["label"].lower()
+            mapped = next((cn for cn, kws in auto_map
+                           if cn in cat_names and any(k in lab for k in kws)), None)
+            key = mapped or r["label"]
+            cfg[key] = entry
+            out.append({"label": r["label"], "category": mapped, "rows": r["rows"],
+                        "sample": r["sample"]})
+        _save_bsr_cfg(cfg)
+        job["captures"] = out
+        job["status"] = "done"
+        job["log"].append(f"[+] 捕获 {len(out)} 个类目榜："
+                          + "；".join(f"{c['label'][:40]}({c['rows']}行)→{c['category'] or '待绑定'}"
+                                      for c in out))
+    except Exception as e:
+        job["log"].append(f"[x] 捕获异常: {type(e).__name__}: {e}")
+        job["status"] = "error"
+    finally:
+        try:
+            if browser:
+                await browser.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/bsr/sources")
+async def bsr_sources_list():
+    """长期 Amazon BSR 榜单源列表（含最近一次抓取时间与 ASIN 数）。"""
+    cfg = _load_routine()
+    wl = _load_watchlist()
+    cache = wl.get("bsr_cache") or {}
+    items = []
+    for e in cfg.get("amz_bsr_urls") or []:
+        cat = e.get("category")
+        c = cache.get(cat) or {}
+        items.append({"category": cat, "url": e.get("url"), "n": e.get("n") or 50,
+                      "count": len(c.get("asins") or []), "ts": c.get("ts") or ""})
+    return {"items": items}
+
+
+@app.post("/api/bsr/sources/add")
+async def bsr_sources_add(req: dict):
+    url = str(req.get("url") or "").strip()
+    category = str(req.get("category") or "").strip()
+    n = int(req.get("n") or 50)
+    if not re.match(r"^https://www\.amazon\.com/", url) or ("bestsellers" not in url and "zgbs" not in url):
+        raise HTTPException(400, "URL 需是 amazon.com 类目 BSR 榜单页（含 bestsellers/zgbs）")
+    if not category:
+        raise HTTPException(400, "备注名称（类目名）不能为空")
+    cfg = _load_routine()
+    lst = cfg.setdefault("amz_bsr_urls", [])
+    if any(e.get("category") == category for e in lst):
+        raise HTTPException(400, f"类目「{category}」已存在，如需更新请先删除")
+    lst.append({"category": category, "url": url, "n": max(10, min(n, 100))})
+    _save_routine(cfg)
+    return {"ok": True, "count": len(lst)}
+
+
+@app.post("/api/bsr/sources/remove")
+async def bsr_sources_remove(req: dict):
+    category = str(req.get("category") or "").strip()
+    cfg = _load_routine()
+    n0 = len(cfg.get("amz_bsr_urls") or [])
+    cfg["amz_bsr_urls"] = [e for e in cfg.get("amz_bsr_urls", [])
+                           if e.get("category") != category]
+    _save_routine(cfg)
+    return {"ok": True, "removed": n0 - len(cfg["amz_bsr_urls"])}
+
+
+@app.post("/api/watchlist/bsr/amazon")
+async def bsr_amazon(req: dict):
+    """从 Amazon 类目 BSR 榜单页（公开榜单）直接提取 ASIN TopN。
+    无需会员/插件：榜单页本身按 Amazon 真实 BSR 排序列出 ASIN；
+    销量/价格等数据随后由 ④ 按 ASIN 批量查询补齐。"""
+    url = str((req or {}).get("url") or "").strip()
+    category = str((req or {}).get("category") or "").strip()
+    n = int((req or {}).get("n") or 50)
+    if not re.match(r"^https://www\.amazon\.com/", url):
+        raise HTTPException(400, "请粘贴 amazon.com 的榜单页 URL（gp/bestsellers 或 zgbs）")
+    if "bestsellers" not in url and "zgbs" not in url:
+        raise HTTPException(400, "URL 需是类目 BSR 榜单页（含 bestsellers/zgbs）")
+    if not category:
+        raise HTTPException(400, "请填写类目名")
+    n = max(10, min(n, 100))
+    job_id = f"amz{int(time.time() * 1000)}"
+    S["jobs"][job_id] = {"status": "running", "log": [], "done": 0, "total": 0, "rows": 0,
+                         "xlsx": None, "type": "amz_bsr", "pct": 0, "detail": "打开榜单页…"}
+    asyncio.create_task(run_bsr_amazon(job_id, url, category, n))
+    return {"job_id": job_id}
+
+
+async def _amz_bsr_fetch(url: str, category: str, n: int):
+    """打开 Amazon 类目 BSR 榜单页（公开），按页面顺序提取前 n 个 ASIN 并写入名单缓存。"""
+    pw = await get_pw()
+    browser = await pw.chromium.launch(
+        headless=True, args=["--disable-blink-features=AutomationControlled"])
+    try:
+        ctx = await browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+            viewport={"width": 1440, "height": 900}, locale="en-US")
+        page2 = await ctx.new_page()
+        asins, seen = [], set()
+        # 榜单分页：bestsellers 第一页只有 30 个，pg=2/3 续抓到 n 为止
+        for pg in range(1, 4):
+            u = url if pg == 1 else f"{url}{'&' if '?' in url else '?'}pg={pg}"
+            await page2.goto(u, wait_until="domcontentloaded", timeout=60000)
+            html = await page2.content()
+            if "api-services-support@amazon.com" in html or "captcha" in html.lower():
+                raise RuntimeError("Amazon 弹了验证码——稍后重试，或人工打开该 URL 过一次验证再试")
+            new = 0
+            for a in re.findall(r"/(?:dp|gp/product)/([A-Z0-9]{10})", html):
+                if a not in seen:
+                    seen.add(a)
+                    asins.append(a)
+                    new += 1
+                if len(asins) >= n:
+                    break
+            if len(asins) >= n or new == 0:
+                break
+            await asyncio.sleep(1.5)
+        if len(asins) < 10:
+            raise RuntimeError(f"榜单页只解析出 {len(asins)} 个 ASIN——页面结构可能变了，把 URL 发我")
+        wl = _load_watchlist()
+        if not any(c.get("name") == category for c in wl["categories"]):
+            wl["categories"].append({"name": category, "tokens": [], "bsr_n": n})
+        wl.setdefault("bsr_cache", {})[category] = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "asins": asins,
+            "items": [{"asin": a, "title": "", "units": None} for a in asins]}
+        _save_watchlist(wl)
+        return asins
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+
+async def run_bsr_amazon(job_id: str, url: str, category: str, n: int):
+    job = S["jobs"][job_id]
+    try:
+        asins = await _amz_bsr_fetch(url, category, n)
+        job["rows"] = len(asins)
+        job["log"].append(f"[+] {category}：Amazon BSR 实时取到 {len(asins)} 个 ASIN（前5: "
+                          f"{', '.join(asins[:5])}）")
+        job["log"].append("[i] 名单已更新——点「按名单查询并入库」即可用④管线补齐销量/价格数据")
+        job["status"] = "done"
+    except Exception as e:
+        job["log"].append(f"[x] {type(e).__name__}: {e}")
+        job["status"] = "error"
+
+
+@app.post("/api/watchlist/bsr/assign")
+async def bsr_assign(req: dict):
+    """把捕获的接口配置绑定到名单类目；类目不存在则自动新建（bsr_n=50）。"""
+    label = str(req.get("label") or "").strip()
+    category = str(req.get("category") or "").strip()
+    if not label or not category:
+        raise HTTPException(400, "label/category 不能为空")
+    cfg = _load_bsr_cfg()
+    if label not in cfg:
+        raise HTTPException(404, "捕获记录不存在（可能已绑定过）")
+    cfg[category] = cfg.pop(label)
+    _save_bsr_cfg(cfg)
+    wl = _load_watchlist()
+    if not any(c.get("name") == category for c in wl["categories"]):
+        wl["categories"].append({"name": category, "tokens": [], "bsr_n": BSR_N_DEFAULT})
+        _save_watchlist(wl)
+    return {"ok": True, "category": category, "note": "点「刷新实时BSR榜」立即拉取该类目"}
+
+
+@app.post("/api/watchlist/bsr/refresh")
+async def bsr_refresh(req: dict = None):
+    res = await _bsr_refresh_all(only_category=(req or {}).get("category"))
+    return res
+
+@app.post("/api/watchlist/run")
+async def watchlist_run(req: dict = None):
+    """把监控名单整体灌入④批量查询（同 run_lookup 管线：快照+Excel+入库）。先尽力刷新实时 BSR 榜。"""
+    try:
+        await _bsr_refresh_all()   # 已配置接口才生效；失败不阻塞
+    except Exception:
+        pass
+    items, _ = _watchlist_items()
+    asins = [i["asin"] for i in items]
+    if not asins:
+        raise HTTPException(400, "监控名单为空——本地库无数据且无手动补充项")
+    label = f"watchlist-{datetime.now():%Y%m%d_%H%M%S}"
+    S["asins"] = asins
+    S["current_task"] = label
+    S["current_seed"] = None
+    S["current_market"] = "US"
+    chunk = int((req or {}).get("chunk") or 150)
+    if chunk <= 0:
+        chunk = 150
+    job_id = f"job{int(time.time() * 1000)}"
+    S["jobs"][job_id] = {"status": "running", "log": [], "done": 0,
+                         "total": len(asins), "rows": 0, "xlsx": None}
+    S["jobs"][job_id]["log"].append(
+        f"[i] 监控名单例跑：{len(asins)} 个 ASIN（{label}）；同 ASIN 重复例跑会累积快照历史，供趋势对比")
+    asyncio.create_task(run_lookup(job_id, chunk))
+    return {"job_id": job_id, "asins": len(asins), "label": label}
+
+# ---------- 每日例跑（一键按星期排任务：④名单 / ⑦补齐 / CL / ⑥收割 / 周报） ----------
+
+ROUTINE_FILE = OUT_DIR / "routine.json"
+ROUTINE_DEFAULTS = {
+    "cl_seeds": {   # 周一~周四 = 已知类目刷新；周五 = 新品类探边（手动填种子）；周六日不花 CL 额度
+        "Mon": "B0HBPT6N7H",   # F3600 Pro（主战场电站）
+        "Tue": "B0BN3VMQRD",   # SP200（太阳能板线）
+        "Wed": "B0H4W51ZMH",   # F2400
+        "Thu": "B0H4W8F84N",   # F1800
+        "Fri": "",             # 新品类探边：在 routine.json 里填一个该品类代表 ASIN
+        "Sat": "", "Sun": "",
+    },
+    "kw_tokens": ["solar", "panel", "power station", "generator"],
+    "kw_daily": 100,        # ⑦ 每日补齐词数（20词/批，主账号+账号池轮转）
+    "watchlist_chunk": 150,
+    "ads_limit": 5,         # ⑥ 周五收割的竞品数
+    "amz_bsr_urls": [],     # Amazon 类目BSR榜单页：[{"category":"便携电站","url":"https://www.amazon.com/gp/bestsellers/...","n":50}]
+    "history": {},          # date -> phases 结果（保留最近 30 天）
+}
+
+
+def _load_routine():
+    if ROUTINE_FILE.exists():
+        try:
+            return json.loads(ROUTINE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    ROUTINE_FILE.parent.mkdir(exist_ok=True)
+    ROUTINE_FILE.write_text(json.dumps(ROUTINE_DEFAULTS, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+    return json.loads(json.dumps(ROUTINE_DEFAULTS))
+
+
+def _save_routine(cfg):
+    cfg["history"] = dict(list(cfg.get("history", {}).items())[-30:])
+    ROUTINE_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _kw_fill_candidates(tokens, n):
+    """从三源合并漏斗里挑缺官方指标的意图词（月搜索量降序）供 ⑦ 补齐。"""
+    official = local_db.official_metrics()
+    imported_all = local_db.ads_all()
+    km_rows = [r for g in imported_all if g.get("source") == "kw_miner" for r in g["rows"]]
+    imported = [g for g in imported_all if g.get("source") != "kw_miner"]
+    harvest = adv.full_rows_to_funnel(local_db.ads_kw_full_all())
+    f = adv.funnel(imported + harvest, min_vol=100,
+                   brands=sorted({"jackery", "ecoflow", "bluetti", "renogy", "anker"}))
+    toks = [t.lower() for t in (tokens or []) if t]
+    cand = [k for k in f["kept"]
+            if k.get("_tier") != "品牌词"
+            and str(k.get("keyword", "")).lower() not in official
+            and (not toks or any(t in str(k.get("keyword", "")).lower() for t in toks))]
+    cand.sort(key=lambda k: -(k.get("月搜索量") or 0))
+    return [str(k.get("keyword")) for k in cand[:n]]
+
+
+@app.get("/api/routine/plan")
+async def routine_plan():
+    cfg = _load_routine()
+    today = date.today()
+    wd = today.strftime("%a")
+    seed = (cfg.get("cl_seeds") or {}).get(wd) or ""
+    plan = ["④ 监控名单快照", "⑦ 官方指标补齐（100词）"]
+    plan.append(f"CL 找竞品（{seed}）" if seed else "CL：今日无种子，跳过")
+    if wd == "Fri":
+        plan += ["⑥ 广告收割 TOP 竞品", "周报归档（全部数据 HTML）"]
+    return {"date": str(today), "weekday": wd, "cl_seed": seed, "plan": plan,
+            "last_run": list((cfg.get("history") or {}).items())[-1:]}
+
+
+@app.post("/api/routine/run")
+async def routine_run():
+    job_id = f"routine{int(time.time() * 1000)}"
+    S["jobs"][job_id] = {"status": "running", "log": [], "done": 0, "total": 0, "rows": 0,
+                         "xlsx": None, "pct": 0, "detail": "排任务中", "type": "routine"}
+    asyncio.create_task(run_routine(job_id))
+    return {"job_id": job_id}
+
+
+async def run_routine(job_id: str):
+    job = S["jobs"][job_id]
+    cfg = _load_routine()
+    today = date.today()
+    wd = today.strftime("%a")
+    phases = {}
+
+    async def phase(name, factory, key, timeout=None):
+        job["log"].append(f"—— 阶段 {name} ——")
+        sub = f"job{int(time.time() * 1000)}{key}"
+        S["jobs"][sub] = {"status": "running", "log": [], "done": 0, "total": 0,
+                          "rows": 0, "xlsx": None}
+        try:
+            if timeout:
+                await asyncio.wait_for(factory(sub), timeout=timeout)
+            else:
+                await factory(sub)
+            subj = S["jobs"][sub]
+            for ln in (subj.get("log") or [])[-200:]:
+                job["log"].append(f"    {ln}")
+            st = subj.get("status") or "done"
+            phases[name] = {"status": st, "rows": subj.get("rows") or 0}
+            job["log"].append(f"[{'+' if st == 'done' else '!'}] 阶段 {name} 结束：{st}"
+                              f"（{subj.get('rows') or 0} 行）")
+        except asyncio.TimeoutError:
+            subj = S["jobs"][sub]
+            for ln in (subj.get("log") or [])[-30:]:
+                job["log"].append(f"    {ln}")
+            try:
+                subj["status"] = "cancelled"
+            except Exception:
+                pass
+            job["log"].append(f"[x] 阶段 {name} 超时（{timeout}s）——强制跳过，防止卡死")
+            phases[name] = {"status": "timeout"}
+        except Exception as e:
+            subj = S["jobs"][sub]
+            for ln in (subj.get("log") or [])[-30:]:
+                job["log"].append(f"    {ln}")
+            job["log"].append(f"[x] 阶段 {name} 失败: {type(e).__name__}: {e}")
+            phases[name] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        job["pct"] = min(95, (job["pct"] or 0) + 20)
+        job["detail"] = f"已完成 {len(phases)} 个阶段"
+
+    job["log"].append(f"[i] 今日 {today:%Y-%m-%d}（{wd}）例跑开始")
+
+    # ④前：Amazon 类目 BSR 榜单刷新（routine.json amz_bsr_urls 配置的类目，公开榜单低频访问）
+    for e in (cfg.get("amz_bsr_urls") or []):
+        try:
+            asins = await _amz_bsr_fetch(str(e.get("url")), str(e.get("category")),
+                                         int(e.get("n") or 50))
+            job["log"].append(f"[+] AmazonBSR·{e.get('category')}：{len(asins)} 个 ASIN（实时榜单）")
+        except Exception as e2:
+            job["log"].append(f"[!] AmazonBSR·{e.get('category')}：{e2}")
+
+    # ④ 监控名单快照（先尽力刷新卖家精灵实时 BSR 榜，已配置接口才生效）
+    try:
+        await _bsr_refresh_all(job_log=job["log"])
+    except Exception as e:
+        job["log"].append(f"[!] 实时BSR刷新跳过: {type(e).__name__}: {e}")
+    items, own_n = _watchlist_items()
+    asins = [i["asin"] for i in items]
+    if asins:
+        S["asins"] = asins
+        S["current_task"] = f"routine-{today:%Y%m%d}"
+        S["current_seed"] = None
+        S["current_market"] = "US"
+        chunk = int(cfg.get("watchlist_chunk") or 150)
+        await phase(f"④监控名单快照（{len(asins)}个）",
+                    lambda sid: run_lookup(sid, chunk), "a", timeout=1200)
+    else:
+        job["log"].append("[!] 监控名单为空，跳过阶段④")
+        phases["④监控名单快照"] = {"status": "skipped"}
+
+    # ⑦ 官方指标补齐（漏斗选缺词 → kw_miner 入库）
+    async def _kw_fill(sid):
+        kws = _kw_fill_candidates(cfg.get("kw_tokens"), int(cfg.get("kw_daily") or 100))
+        S["jobs"][sid]["total"] = len(kws)
+        if not kws:
+            S["jobs"][sid]["log"].append("[i] 意图词官方指标已全部补齐，无需查询")
+            S["jobs"][sid]["status"] = "done"
+            return
+        S["jobs"][sid]["log"].append(f"[i] 待补 {len(kws)} 词（缺购买率/需供比，月搜索降序）")
+        def on_batch(rows, label):
+            S["jobs"][sid]["rows"] = (S["jobs"][sid]["rows"] or 0) + local_db.save_ads("kw_miner", "US", rows)
+            S["jobs"][sid]["done"] = (S["jobs"][sid]["done"] or 0) + 20
+            S["jobs"][sid]["log"].append(f"[+] 批次入库 {len(rows)} 行（{label}号）")
+        rows = await _kw_miner_fetch(kws, 1, on_batch)
+        S["jobs"][sid]["log"].append(f"[+] 完成：返回 {len(rows)} 行，已在库")
+        S["jobs"][sid]["status"] = "done"
+    await phase("⑦官方指标补齐", _kw_fill, "b", timeout=1200)
+
+    # CL 找竞品（按星期；5 额度/次）
+    seed = (cfg.get("cl_seeds") or {}).get(wd) or ""
+    if seed:
+        await phase(f"CL找竞品（{seed}）",
+                    lambda sid: run_cl_job(sid, [seed], None, None, True), "c", timeout=1500)
+        job["log"].append("[i] CL 产出竞品已自动提取，明天 ④ 例跑会自动覆盖到新 ASIN；"
+                          "也可现在回④手动查询一次立即入库")
+    else:
+        job["log"].append(f"[i] {wd} 未配置 CL 种子，跳过（routine.json → cl_seeds.{wd}）")
+        phases["CL找竞品"] = {"status": "skipped"}
+
+    # 周五：⑥ 广告收割 + 周报归档
+    if wd == "Fri":
+        if S["asins"]:
+            await phase("⑥广告收割TOP竞品",
+                        lambda sid: run_ads_auto(sid, int(cfg.get("ads_limit") or 5), 4, 3),
+                        timeout=3600, key="d")
+        try:
+            rows = local_db.latest(None)
+            if rows:
+                fp = OUT_DIR / f"weekly_{today:%Y%m%d}_html.html"
+                make_report.build_html_report(rows, f"weekly-{today:%Y%m%d}", str(fp),
+                                              market="US")
+                job["log"].append(f"[+] 周报已归档: {fp.name}（{len(rows)} 行）")
+                phases["周报归档"] = {"status": "done", "file": fp.name}
+        except Exception as e:
+            job["log"].append(f"[x] 周报归档失败: {type(e).__name__}: {e}")
+            phases["周报归档"] = {"status": "error", "error": str(e)}
+
+    cfg.setdefault("history", {})[str(today)] = {
+        "phases": phases, "at": datetime.now().isoformat(timespec="seconds")}
+    _save_routine(cfg)
+    job["pct"], job["detail"] = 100, "完成"
+    bad = [k for k, v in phases.items() if v.get("status") == "error"]
+    job["status"] = "done"
+    job["log"].append(f"[i] 例跑结束。成功 {len(phases) - len(bad)}/{len(phases)}"
+                      + (f"；异常阶段: {', '.join(bad)}（多为会话失效，登录后明天会重试）" if bad else ""))
+
 
 @app.get("/api/job/{job_id}")
 async def job_status(job_id: str):
@@ -573,17 +1340,80 @@ async def job_download(job_id: str):
 
 # ---------- 美化报告（从本地数据库生成） ----------
 
+def _report_rows(scope: str):
+    """⑤报告的数据范围：
+    current = 当前分析（本次查询的完整返回优先，含变体展开行；
+              否则当前任务 ASIN 集合的各自最新快照）；
+    global  = 本地库全部 ASIN 的最新快照（跨所有历史批次）。"""
+    if scope == "current":
+        if S.get("last_rows") and S.get("last_rows_task") == S.get("current_task"):
+            return S["last_rows"]
+        if S["asins"]:
+            return local_db.latest(S["asins"])
+        raise HTTPException(400, "当前没有分析中的任务——请先在第②步选择任务并在第③步提取 ASIN，"
+                                 "或把范围切换为'全部数据'")
+    return local_db.latest(None)
+
+
 @app.post("/api/report")
-async def build_styled_report():
-    # 优先用最近一次查询的完整返回（含变体代表行）；否则回退本地库取全部最新快照
-    rows = S.get("last_rows") or local_db.latest(S["asins"] or None)
+async def build_styled_report(req: dict = None):
+    scope = ((req or {}).get("scope") or "current").lower()
+    if scope not in ("current", "global"):
+        scope = "current"
+    rows = _report_rows(scope)
     if not rows:
-        raise HTTPException(400, "本地库中还没有数据，请先运行批量查询")
-    fp = OUT_DIR / f"styled_report_{(S['current_task'] or 'web')[:12]}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+        raise HTTPException(400, "所选范围内没有数据，请先运行批量查询")
+    fp = OUT_DIR / f"{_scope_label(scope)}_style_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
     make_report.build_report(rows, S["current_task"], str(fp),
                              market=S.get("current_market") or "US")
     S["last_report"] = str(fp)
-    return {"ok": True, "count": len(rows), "file": fp.name}
+    return {"ok": True, "scope": scope, "count": len(rows), "file": fp.name}
+
+@app.post("/api/report_html")
+async def build_html(req: dict = None):
+    """美化报告 HTML 版（阅读/决策视图）：统计卡片 + 销量趋势图 + 可排序/筛选/缩略图表格。
+    自包含单文件，xlsx 保留负责原始字段与后续计算。
+    scope=current（默认）= 仅当前分析任务的数据；scope=global = 本地库全部数据。"""
+    scope = ((req or {}).get("scope") or "current").lower()
+    if scope not in ("current", "global"):
+        scope = "current"
+    rows = _report_rows(scope)
+    if not rows:
+        raise HTTPException(400, "所选范围内没有数据，请先运行批量查询")
+    fp = OUT_DIR / f"{_scope_label(scope)}_html_{datetime.now():%Y%m%d_%H%M%S}.html"
+    make_report.build_html_report(rows, S["current_task"], str(fp),
+                                  market=S.get("current_market") or "US")
+    S["last_report"] = str(fp)
+    return {"ok": True, "scope": scope, "count": len(rows), "file": fp.name}
+
+@app.post("/api/ai_pack")
+async def ai_pack(req: dict = None):
+    """生成 AI 分析包（Markdown，预聚合、紧凑上下文，可直接粘贴给外部 AI）。
+    scope 同⑤；产品层 Top N（默认200）、关键词层 Top M（默认150，标准词按综合分）。"""
+    scope = ((req or {}).get("scope") or "current").lower()
+    if scope not in ("current", "global"):
+        scope = "current"
+    top_products = min(int((req or {}).get("top_products") or 200), 1000)
+    top_keywords = min(int((req or {}).get("top_keywords") or 150), 500)
+    rows = _report_rows(scope)
+    if not rows:
+        raise HTTPException(400, "所选范围内没有数据，请先运行批量查询")
+    # 关键词层：全局漏斗（与②同源），官方指标补位
+    imported_all = local_db.ads_all()
+    km_rows = [r for g in imported_all if g.get("source") == "kw_miner" for r in g["rows"]]
+    imported = [g for g in imported_all if g.get("source") != "kw_miner"]
+    harvest = adv.full_rows_to_funnel(local_db.ads_kw_full_all())
+    brands = sorted({(p.get("brand") or "").strip().lower()
+                     for p in local_db.latest() if p.get("brand")})
+    f = adv.funnel(imported + harvest, min_vol=500, brands=brands, enrich_rows=km_rows)
+    fp = OUT_DIR / f"{_scope_label(scope)}_aipack_{datetime.now():%Y%m%d_%H%M%S}.md"
+    make_report.build_ai_pack(rows, f["kept"], str(fp), scope_label=_scope_label(scope),
+                              top_products=top_products, top_keywords=top_keywords)
+    S["last_report"] = str(fp)
+    size_kb = fp.stat().st_size / 1024
+    return {"ok": True, "count": len(rows), "kept_kw": len(f["kept"]),
+            "file": fp.name, "size_kb": round(size_kb, 1),
+            "est_tokens": round(size_kb * 1024 / 4 / 1000, 1)}   # 粗估 token（~4字符/token）
 
 @app.get("/api/report/download")
 async def report_download():
@@ -755,7 +1585,7 @@ async def run_ads_report(job_id: str, min_vol: int, scope: str, backfill: bool):
             raise RuntimeError(f"阈值 {min_vol} 下 {f['total_kw']} 个词全部被过滤，请调低阈值")
 
         job["phase"] = "生成 Excel"
-        fp = OUT_DIR / f"ads_report_{scope}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+        fp = OUT_DIR / f"{_scope_label(scope)}_ads_report_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
         meta = {"min_vol": min_vol, "total_kw": f["total_kw"], "dropped": f["dropped"],
                 "scope": "仅当前分析的ASIN" if scope == "current" else "全部历史数据",
                 "sources": f"⚡自动抓取 {len(harvest)} 个竞品 + ①导入 {len(imported)} 个来源"}
@@ -774,8 +1604,9 @@ async def run_ads_report(job_id: str, min_vol: int, scope: str, backfill: bool):
 
 @app.post("/api/ads/clean")
 async def ads_clean(req: dict = None):
-    """广告词价值排序与清洗：价值函数 v2（多因子：购买体量/购买转化/需求规模/广告验证/市场定价/
-    供需空间，官方 ARA 数据参与评分），品牌词按本地库品牌表数据驱动分层，不剔除任何词"""
+    """广告词价值排序与清洗：价值函数 v2（多因子：购买体量/购买转化/需求规模/广告排名(ASIN)/
+    市场点击热度/市场定价/供需空间，官方 ARA 数据参与评分——注意官方指标与搜索/点击量均为
+    词级市场口径，ASIN 级信号仅广告排名与来源归属），品牌词按本地库品牌表数据驱动分层，不剔除任何词"""
     min_searches = int((req or {}).get("min_searches") or 0)
     grouped = local_db.ads_kw_full_all()
     rows = []
@@ -790,7 +1621,7 @@ async def ads_clean(req: dict = None):
     official = local_db.official_metrics()
     kept, stat = adv.relevance_filter(rows, min_searches=min_searches, brands=brands,
                                       official=official)
-    fp = OUT_DIR / f"ads_keywords_clean_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+    fp = OUT_DIR / f"{_scope_label('global')}_clean_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
     make_report.build_clean_report(kept, str(fp))   # 总览 + 按来源ASIN分页
     S["last_report"] = str(fp)
     return {"ok": True, "kept": len(kept), "total": len(rows), **stat, "file": fp.name}
@@ -823,8 +1654,9 @@ async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: i
             try:
                 r = await adv.fetch_ads_groups(page_vip, asin)
                 local_db.save_groups(asin, r)
-                job["log"].append(f"[+] 组结构已缓存: {r.get('adCount')} 组 / "
-                                  f"关键词上限 {r.get('maxKeywordsCount')}")
+                job["log"].append(f"[+] 组结构已缓存: 自身 {len(r.get('groups') or [])} 组"
+                                  f"（接口返回 {r.get('adCount')} 组，剔除发散 ASIN 组 "
+                                  f"{r.get('skippedGroups')}）/ 关键词上限 {r.get('maxKeywordsCount')}")
                 job["done"] = i
                 await asyncio.sleep(1)
                 continue
@@ -874,7 +1706,7 @@ async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: i
         for who in attempts:
             try:
                 rows = await adv.fetch_group_keywords(page_main if who == "main" else page_vip,
-                                                      ad_id, b, e, max_pages=2)
+                                                      ad_id, b, e, max_pages=2, asin=asin)
                 kw_page_choice[who] += 1
                 return rows, who
             except adv.SessionExpired as e1:
@@ -1072,7 +1904,8 @@ async def cleanup(req: dict = None):
     ① deep_results/ 下的历史 Excel 报告（styled_report_/ads_report_/ads_keywords_clean_/deep_dive_），
        每类保留最新 keep_reports 份；
     ② ads_debug/ 与 lookup_debug/ 的接口调试转储（全部）；
-    ③ deep_results/ 下的 debug_cl_*.png 现场截图（全部）。
+    ③ deep_results/ 下的 debug_cl_*.png 现场截图（全部）；
+    ④ 数据库内历史误抓的发散 ASIN 广告组/关键词行（ads_groups/ads_kw_full 归属校验清除）。
     保留：asins_*.json（报告分页依赖的"我分析的ASIN"映射）、数据库、登录态。"""
     keep = int((req or {}).get("keep_reports") or 3)
     dry = bool((req or {}).get("dry_run"))
@@ -1090,13 +1923,17 @@ async def cleanup(req: dict = None):
         except Exception:
             pass
 
-    # ① 历史报告：按前缀分组，各组保留最新 keep 份
-    prefixes = ("styled_report_", "ads_report_", "ads_keywords_clean_", "deep_dive_")
+    # ① 历史报告：按功能 token 分组（新命名 [ASIN/ALL]_[功能]_[时间]；旧命名归入 other），各组保留最新 keep 份
+    utils = ("_deepdive_", "_style_", "_html_", "_ads_report_", "_clean_", "_aipack_")
     rep_rm = 0
     if OUT_DIR.exists():
-        for pre in prefixes:
-            files = sorted(OUT_DIR.glob(f"{pre}*.xlsx"),
-                           key=lambda p: p.stat().st_mtime, reverse=True)
+        groups = {}
+        for p in OUT_DIR.iterdir():
+            if p.is_file() and p.suffix in (".xlsx", ".html", ".md"):
+                u = next((u for u in utils if u in p.name), "_other_")
+                groups.setdefault(u, []).append(p)
+        for u, files in groups.items():
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             for p in files[max(keep, 0):]:
                 _rm(p)
                 rep_rm += 1
@@ -1114,9 +1951,16 @@ async def cleanup(req: dict = None):
         for p in OUT_DIR.glob("debug_cl_*.png"):
             _rm(p)
             png_rm += 1
+    # ④ 数据库内发散 ASIN 误抓数据（旧版无 ASIN 归属约束时期入库的）
+    purged = {"groups_deleted": 0, "keywords_deleted": 0}
+    if not dry:
+        purged = local_db.purge_foreign_ads()
+
     return {"ok": True, "dry_run": dry, "files": n_files,
             "freed_mb": round(freed / 1048576, 1),
-            "detail": {"旧报告": rep_rm, "调试转储": dbg_rm, "截图": png_rm}}
+            "detail": {"旧报告": rep_rm, "调试转储": dbg_rm, "截图": png_rm,
+                       "发散ASIN组清除": purged["groups_deleted"],
+                       "发散ASIN关键词行清除": purged["keywords_deleted"]}}
 
 # ---------- 页面 ----------
 

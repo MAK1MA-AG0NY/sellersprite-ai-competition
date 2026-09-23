@@ -401,6 +401,196 @@ def _inject_asins(body, asins):
                 setin(x)
     setin(body)
 
+
+# ---------- 类目 BSR 榜（competitor-lookup 类目模式：实时 Top N，非会员可查） ----------
+
+BSR_PAGE_URL = f"{BASE}/v3/competitor-lookup/?market=US&monthName=bsr_sales_nearly"
+
+
+async def _bsr_category_label(page2):
+    """从官网页面 DOM 读当前选中的类目路径（Element-UI cascader）。"""
+    try:
+        return await page2.evaluate("""() => {
+          const out = [];
+          document.querySelectorAll('.el-cascader input').forEach(i => {
+            const v = (i.value || '').trim(); if (v) out.push(v);
+          });
+          if (!out.length) document.querySelectorAll('.el-cascader__label').forEach(e => {
+            const v = (e.textContent || '').trim(); if (v) out.push(v);
+          });
+          if (!out.length) {
+            document.querySelectorAll('.el-cascader-node.in-checked-path .el-cascader-node__label')
+              .forEach(e => out.push((e.textContent || '').trim()));
+          }
+          return out.join(' > ');
+        }""")
+    except Exception:
+        return ""
+
+
+def _safe_json(s):
+    """post_data 可能是表单串/二进制残片，解析失败返回 None（不炸捕获循环）。"""
+    try:
+        return json.loads(s) if s else None
+    except Exception:
+        return None
+
+
+async def _safe_close(page2, closed):
+    try:
+        if not closed["flag"]:
+            await page2.close()
+    except Exception:
+        pass
+
+
+async def probe_bsr_capture(page2, seconds=300, url=None):
+    """在【可见浏览器】的 page2 上挂流量捕获：用户像官网一样选类目→查询（可连续多个），
+    每次查询捕获一份可复放接口配置，并从 DOM 读取类目路径作为标签。
+    操作完直接关闭该标签页即可提前结束。调用方负责打开/关闭浏览器。
+    返回 captures 列表。"""
+    captured, results, seen_sig = [], [], set()
+    closed = {"flag": False}
+    page2.on("close", lambda _=None: closed.update(flag=True))
+
+    async def on_response(resp):
+        req = resp.request
+        try:
+            if req.resource_type not in ("xhr", "fetch") and req.method == "GET":
+                return
+            entry = {"method": req.method, "url": resp.url, "status": resp.status}
+            try:
+                entry["post_data"] = req.post_data
+            except Exception:
+                entry["post_data"] = None
+            try:
+                body = await resp.body()
+                if len(body) <= 5_000_000:
+                    entry["body"] = body.decode("utf-8", "replace")
+            except Exception:
+                pass
+            captured.append(entry)
+        except Exception:
+            pass
+
+    page2.on("response", on_response)
+    try:
+        await page2.goto(url or BSR_PAGE_URL, wait_until="domcontentloaded")
+    except Exception as e:
+        await _safe_close(page2, closed)
+        raise RuntimeError(f"类目BSR页面打开失败: {type(e).__name__}: {e}")
+    t0 = time.time()
+    node_map = None
+
+    async def resolve_label(node_ids):
+        """node id 列表 → 可读类目路径（用 product-research/init 的类目树，结果缓存）。"""
+        nonlocal node_map
+        if node_map is None:
+            node_map = {}
+            try:
+                j = await api_get(page2, "/v3/api/product-research/init")
+                def walk(node):
+                    if isinstance(node, dict):
+                        nid = node.get("nodeId", node.get("categoryId", node.get("id")))
+                        nm = node.get("nodeName") or node.get("name") or node.get("title")
+                        if nid is not None and nm:
+                            node_map.setdefault(str(nid), str(nm))
+                        for v in node.values():
+                            walk(v)
+                    elif isinstance(node, list):
+                        for x in node:
+                            walk(x)
+                walk(j.get("data") if isinstance(j, dict) else j)
+            except Exception:
+                pass
+        return " > ".join(node_map.get(i, i) for i in node_ids)
+
+    seen_nodes = set()
+    while time.time() - t0 < max(15, int(seconds)) and not closed["flag"]:
+        try:
+            await page2.wait_for_timeout(1000)
+        except Exception:
+            break   # 页面被用户关闭 = 提前结束捕获
+        for c in captured:
+            sig = (c["url"], c.get("post_data") or "")
+            if sig in seen_sig:
+                continue
+            seen_sig.add(sig)
+            if "sellersprite.com" not in c["url"] or not c.get("body", "").strip().startswith("{"):
+                continue
+            try:
+                j = json.loads(c["body"])
+            except Exception:
+                continue
+            rows = _find_rows(j)
+            if not rows:
+                continue
+            pd = _safe_json(c.get("post_data")) or {}
+            node_paths = pd.get("nodeIdPaths")
+            label = ""
+            if isinstance(node_paths, list):
+                if not node_paths:
+                    continue   # 页面加载时自动触发的全量默认查询（未选类目），跳过
+                node_ids = [x for p in node_paths for x in str(p).split(":") if x]
+                key_nodes = tuple(node_ids)
+                if key_nodes in seen_nodes:
+                    continue   # 同一类目重复查询，去重
+                seen_nodes.add(key_nodes)
+                label = await resolve_label(node_ids)
+            else:
+                label = await _bsr_category_label(page2)
+            results.append({
+                "label": (label or f"capture{len(results) + 1}").strip(),
+                "method": c["method"], "url": c["url"].replace(BASE, ""),
+                "post_data": _safe_json(c.get("post_data")),
+                "rows": len(rows),
+                "sample": [str(r.get("asin")) for r in rows[:5]],
+                "captured_at": datetime.now().isoformat(timespec="seconds")})
+    dbg = HERE / "lookup_debug"
+    dbg.mkdir(exist_ok=True)
+    (dbg / f"bsr_probe_{datetime.now():%Y%m%d_%H%M%S}.json").write_text(
+        json.dumps({"captures": results,
+                    "captured": [{k: v for k, v in c.items() if k != "body"} for c in captured]},
+                   ensure_ascii=False), encoding="utf-8")
+    await _safe_close(page2, closed)
+    return results
+
+
+async def bsr_fetch(page, cfg, n=50, max_pages=10):
+    """按已捕获配置复放类目BSR榜请求，取前 n 个 ASIN（尽量翻页；页参数名与站点一致用 page）。"""
+    rows_all = []
+    if cfg.get("method") == "GET":
+        j = await api_get(page, cfg["url"])
+        rows_all = _find_rows(j) or []
+    else:
+        body = json.loads(json.dumps(cfg.get("post_data") or {}))
+        for page_num in range(1, max_pages + 1):
+            body["page"] = page_num
+            j = await api_post(page, cfg["url"], body)
+            d = j.get("data") if isinstance(j, dict) else None
+            if not isinstance(d, dict):
+                code = j.get("code") if isinstance(j, dict) else "?"
+                msg = (j.get("message") or str(d))[:120] if isinstance(j, dict) else "?"
+                if "SESSION" in str(code) or "登陆" in msg or "登录" in msg:
+                    raise RuntimeError(f"登录态已失效（{msg}）——请重新登录后重试")
+                raise RuntimeError(f"接口返回异常 {code}: {msg}")
+            its = d.get("items") or _find_rows(j) or []
+            if not its:
+                break
+            rows_all.extend(its)
+            if len(rows_all) >= n:
+                break
+            await asyncio.sleep(1)
+    seen, out = set(), []
+    for r in rows_all:
+        a = str(r.get("asin") or "").strip().upper()
+        if a and re.fullmatch(r"[A-Z0-9]{10}", a) and a not in seen:
+            seen.add(a)
+            out.append(r)
+        if len(out) >= n:
+            break
+    return out
+
 async def ctx_new_page(page):
     return await page.context.new_page()
 

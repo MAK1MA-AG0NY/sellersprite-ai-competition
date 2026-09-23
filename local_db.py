@@ -264,15 +264,71 @@ def save_groups(asin, result):
 
 
 def groups_for(asin):
-    """某 ASIN 已入库的组结构列表。"""
+    """某 ASIN 已入库的组结构列表。
+    防御过滤：接口历史响应里混有"发散 ASIN"的广告组（组自身 asin 字段 != 查询 ASIN），
+    即使已被旧版入库也不参与收割，防止他品关键词错记到本 ASIN 名下。"""
     c = _conn()
     try:
         cur = c.execute("SELECT ad_id, data FROM ads_groups WHERE asin=? ORDER BY id", (asin,))
         out = []
+        asin_u = str(asin).strip().upper()
         for ad_id, data in cur.fetchall():
             g = json.loads(data)
+            own = str(g.get("asin") or "").strip().upper()
+            if own and own != asin_u:
+                continue   # 发散 ASIN 的组，丢弃
             g.setdefault("adId", ad_id)
             out.append(g)
         return out
+    finally:
+        c.close()
+
+
+def purge_foreign_ads():
+    """清除历史误抓的发散 ASIN 数据：
+    1) ads_groups 中 组自身 asin != 存储 asin 的行；
+    2) ads_kw_full 中 ad_id 归属（按组自身 asin 判定）!= 存储 asin 的关键词行；
+    3) ads_kw_full 中 行级 asin（该词实际投放商品，组合组内会混投他品）!= 存储 asin 的行。
+    返回 {'groups_deleted': n, 'keywords_deleted': n}。"""
+    c = _conn()
+    try:
+        # ad_id -> 组自身 asin（以 ads_groups 数据里的 asin 字段为准）
+        own_map = {}
+        for ad_id, data in c.execute("SELECT ad_id, data FROM ads_groups"):
+            try:
+                g = json.loads(data)
+            except Exception:
+                continue
+            own = str(g.get("asin") or "").strip().upper()
+            if own:
+                own_map[ad_id] = own
+        n_kw = 0
+        for sasin, ad_id, kw in c.execute("SELECT asin, ad_id, keyword FROM ads_kw_full").fetchall():
+            g_asin = own_map.get(str(ad_id))
+            if g_asin and g_asin != str(sasin).strip().upper():
+                c.execute("DELETE FROM ads_kw_full WHERE asin=? AND ad_id=? AND keyword=?",
+                          (sasin, ad_id, kw))
+                n_kw += 1
+        # 第二层：组合/店铺型广告组内混投的其他产品——关键词行自身 asin 字段
+        # = 该词实际投放的商品 ASIN，与存储 ASIN 不符的行同样是发散噪声
+        n_kw2 = c.execute(
+            "SELECT COUNT(*) FROM ads_kw_full WHERE "
+            "json_extract(data,'$.asin') IS NOT NULL AND json_extract(data,'$.asin') != '' AND "
+            "UPPER(json_extract(data,'$.asin')) != UPPER(asin)").fetchone()[0]
+        c.execute(
+            "DELETE FROM ads_kw_full WHERE "
+            "json_extract(data,'$.asin') IS NOT NULL AND json_extract(data,'$.asin') != '' AND "
+            "UPPER(json_extract(data,'$.asin')) != UPPER(asin)")
+        n_kw += n_kw2
+        n_g = c.execute(
+            "SELECT COUNT(*) FROM ads_groups WHERE "
+            "json_extract(data,'$.asin') IS NOT NULL AND "
+            "UPPER(json_extract(data,'$.asin')) != UPPER(asin)").fetchone()[0]
+        c.execute(
+            "DELETE FROM ads_groups WHERE "
+            "json_extract(data,'$.asin') IS NOT NULL AND "
+            "UPPER(json_extract(data,'$.asin')) != UPPER(asin)")
+        c.commit()
+        return {"groups_deleted": n_g, "keywords_deleted": n_kw}
     finally:
         c.close()

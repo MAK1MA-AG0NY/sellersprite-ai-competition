@@ -207,26 +207,347 @@ def build_report(rows, task_id, out_path, market="US"):
     return out_path
 
 
+# ---------- HTML 报告（阅读/决策视图，自包含单文件，零外部依赖） ----------
+
+import html as _html_mod
+
+
+def _esc(v):
+    return _html_mod.escape(str(v if v is not None else "-"))
+
+
+def _spark(trend, w=110, h=26, color="#ff7a1a"):
+    """月销量迷你趋势线（SVG polyline，按自身最大值归一）。"""
+    pts = [(m, v) for m, v in sorted((trend or {}).items()) if isinstance(v, (int, float))]
+    vals = [v for _, v in pts][-18:]
+    if len(vals) < 2:
+        return ""
+    hi, lo = max(vals), min(vals)
+    rng = (hi - lo) or 1
+    step = w / (len(vals) - 1)
+    coords = " ".join("%.1f,%.1f" % (i * step, h - 2 - (v - lo) / rng * (h - 4))
+                      for i, v in enumerate(vals))
+    return ('<svg width="%d" height="%d"><polyline points="%s" fill="none" stroke="%s" '
+            'stroke-width="1.5"/></svg>' % (w, h, coords, color))
+
+
+def build_html_report(rows, task_id, out_path, market="US"):
+    """美化报告 HTML 版：统计卡片 + 总体销量趋势图 + 可排序/筛选/缩略图的交互表格。
+    自包含单文件（内联 CSS/JS/SVG），xlsx 保留负责原始字段与后续计算。"""
+    from datetime import datetime
+    domain = market_domain(market)
+    rows = [r for r in rows if r.get("asin")]
+    rows.sort(key=lambda r: -(r.get("totalUnits") or 0))
+    now = datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M")
+
+    prices = sorted(float(r["price"]) for r in rows if isinstance(r.get("price"), (int, float)))
+    med_price = prices[len(prices) // 2] if prices else 0
+    total_units = sum(r.get("totalUnits") or 0 for r in rows if isinstance(r.get("totalUnits"), (int, float)))
+    brands = sorted({str(r.get("brand") or "-") for r in rows})
+    avg_rating = (sum(r.get("rating") for r in rows if isinstance(r.get("rating"), (int, float)))
+                  / max(sum(1 for r in rows if isinstance(r.get("rating"), (int, float))), 1))
+
+    def _trend(r):
+        return _parse_trend(r.get("salesTrend"))
+
+    # 总体趋势图：月销 Top10 的绝对值折线
+    top10 = rows[:10]
+    all_months = sorted({m for r in top10 for m in _trend(r)})[-18:]
+    CW, CH = 900, 260
+    hi = max([v for r in top10 for v in _trend(r).values() if isinstance(v, (int, float))] or [1])
+    lines, labels = [], []
+    for i, r in enumerate(top10):
+        t = _trend(r)
+        pts = []
+        for j, m in enumerate(all_months):
+            v = t.get(m)
+            if isinstance(v, (int, float)):
+                x = 40 + j * ((CW - 60) / max(len(all_months) - 1, 1))
+                y = CH - 24 - v / max(hi, 1) * (CH - 44)
+                pts.append("%.1f,%.1f" % (x, y))
+        color = "hsl(%d,65%%,45%%)" % (i * 360 / max(len(top10), 1))
+        if pts:
+            lines.append('<polyline points="%s" fill="none" stroke="%s" stroke-width="1.6"/>' % (" ".join(pts), color))
+        labels.append('<span style="color:%s">■</span> %s' % (color, _esc(r.get("asin"))))
+
+    def _cell(v, fmt=None):
+        if isinstance(v, (int, float)):
+            return '<td data-v="%s">%s</td>' % (v, "{:,}".format(v) if fmt == "int" else v)
+        return '<td>%s</td>' % _esc(v)
+
+    def _fmt_int(v):
+        return "{:,}".format(v) if isinstance(v, (int, float)) else "-"
+
+    trs = []
+    for r in rows:
+        t = _trend(r)
+        asin, brand, title = _esc(r.get("asin")), _esc(r.get("brand")), _esc(r.get("title"))
+        price = r.get("price")
+        rating = r.get("rating")
+        units, amount = r.get("totalUnits"), r.get("totalAmount")
+        growth, bsr = r.get("totalUnitsGrowth"), r.get("bsrRank")
+        days, vari, lqs = r.get("availableDays"), r.get("variations"), r.get("lqs")
+        url = f"https://{domain}/dp/{r.get('asin')}"
+        img = (f'<img src="{_esc(r.get("bigImageUrl"))}" loading="lazy" width="52" '
+               f'style="border-radius:6px">') if r.get("bigImageUrl") else "-"
+        rev_html = (f' <small style="color:#8a94a6">({r.get("reviews"):,})</small>'
+                    ) if isinstance(r.get("reviews"), (int, float)) else ""
+        badge = " / ".join(str(r.get(k)) for k in ("amazonChoice", "newRelease") if r.get(k)) or ""
+        trs.append(f'''<tr data-brand="{brand}"><td>{img}</td>'''
+                  f'''<td><a href="{url}" target="_blank" style="color:#e8620a;font-weight:600">{asin}</a></td>'''
+                  f'''<td>{brand}</td><td style="max-width:340px">{title}</td>'''
+                  f'''<td data-v="{price or 0}">{price if price is not None else "-"}</td>'''
+                  f'''<td data-v="{rating or 0}">{rating if rating is not None else "-"}{rev_html}</td>'''
+                  f'''<td data-v="{units or 0}">{_fmt_int(units)}</td>'''
+                  f'''<td data-v="{amount or 0}">{_fmt_int(round(amount)) if isinstance(amount, (int, float)) else "-"}</td>'''
+                  f'''<td data-v="{growth or 0}">{growth if growth is not None else "-"}%</td>'''
+                  f'''<td data-v="{bsr or 0}">{_fmt_int(bsr)}</td>'''
+                  f'''<td data-v="{days or 0}">{days if days is not None else "-"}</td>'''
+                  f'''<td data-v="{vari or 0}">{vari if vari is not None else "-"}</td>'''
+                  f'''<td data-v="{lqs or 0}">{lqs if lqs is not None else "-"}</td>'''
+                  f'''<td>{_spark(t)}</td><td>{_esc(badge)}</td><td>{_esc(r.get("bsrLabel"))}</td></tr>''')
+    trs_html = "\n".join(trs)
+
+    page = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>竞品分析报告 __TASKID__</title>
+<style>
+ body { font-family:"Segoe UI","Microsoft YaHei",sans-serif; background:#f5f6fa; color:#26303e; margin:0; }
+ header { background:linear-gradient(120deg,#ff8c2e,#f05a00); color:#fff; padding:20px 30px; }
+ header h1 { font-size:20px; margin:0; } header p { opacity:.85; font-size:12.5px; margin:6px 0 0; }
+ .wrap { max-width:1220px; margin:0 auto; padding:20px; }
+ .cards { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:18px; }
+ .card { background:#fff; border-radius:12px; padding:14px 20px; border:1px solid #e8ebf1;
+         box-shadow:0 1px 4px rgba(38,48,62,.06); min-width:150px; }
+ .card b { font-size:20px; display:block; } .card span { color:#8a94a6; font-size:12px; }
+ .panel { background:#fff; border-radius:14px; padding:18px 20px; border:1px solid #e8ebf1; margin-bottom:18px; }
+ .panel h2 { font-size:15px; margin:0 0 12px; }
+ .legend { font-size:12px; color:#556; line-height:1.9; }
+ .ctl { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+ input, select { padding:7px 10px; border:1px solid #e8ebf1; border-radius:8px; font-size:13px; }
+ table { width:100%; border-collapse:collapse; font-size:12.5px; }
+ th { background:#ff7a1a; color:#fff; padding:8px 9px; cursor:pointer; user-select:none; white-space:nowrap; }
+ th:hover { background:#e8620a; }
+ td { padding:7px 9px; border-bottom:1px solid #eef0f5; vertical-align:middle; }
+ tr:hover td { background:#fff7ef; }
+ .note { color:#8a94a6; font-size:12px; margin-top:10px; }
+</style></head><body>
+<header><h1>竞品分析报告 · __TASKID__</h1>
+<p>生成时间 __NOW__ (北京时间) · 站点 __MKT__ · 数据来源：卖家精灵竞品查询 · 月销/销售额为平台估算值</p></header>
+<div class="wrap">
+ <div class="cards">
+  <div class="card"><b>__NCARDS__ 个</b><span>竞品 ASIN</span></div>
+  <div class="card"><b>__TUNITS__</b><span>合计月销量(估)</span></div>
+  <div class="card"><b>$__MED__</b><span>价格中位数</span></div>
+  <div class="card"><b>__NRAND__ 个</b><span>品牌数</span></div>
+  <div class="card"><b>__RATING__</b><span>平均评分</span></div>
+ </div>
+ <div class="panel"><h2>销量趋势 · 月销 Top10（绝对值）</h2>
+  <svg width="100%" viewBox="0 0 __CW__ __CH__" preserveAspectRatio="xMidYMid meet">__LINES__</svg>
+  <div class="legend">__LABELS__</div></div>
+ <div class="panel"><h2>竞品明细（点击表头排序）</h2>
+  <div class="ctl">
+   <input id="q" placeholder="搜索 ASIN / 标题 / 品牌…" style="flex:1;min-width:200px">
+   <select id="bf"><option value="">全部品牌</option>__BOPT__</select>
+  </div>
+  <div style="overflow-x:auto;"><table id="t"><thead><tr>
+   <th>图</th><th data-k="1" data-n="0">ASIN</th><th data-k="2" data-n="0">品牌</th><th>标题</th>
+   <th data-k="4" data-n="1">价格$</th><th data-k="5" data-n="1">评分</th>
+   <th data-k="6" data-n="1">月销量↓</th><th data-k="7" data-n="1">月销额$</th>
+   <th data-k="8" data-n="1">环比%</th><th data-k="9" data-n="1">BSR</th>
+   <th data-k="10" data-n="1">上架天数</th><th data-k="11" data-n="1">变体</th>
+   <th data-k="12" data-n="1">LQS</th><th>趋势</th><th>徽章</th><th>BSR类目</th>
+  </tr></thead><tbody>
+__TRS__
+  </tbody></table></div>
+  <div class="note">129 字段原始数据请用 xlsx 版（⑤ Excel 报告）；价格/销量为卖家精灵估算值。逐 ASIN 趋势线见"趋势"列（近18月，按自身幅度归一）。</div>
+ </div>
+</div>
+<script>
+var tb = document.getElementById('t').tBodies[0];
+function sortBy(ci, numeric) {
+  var rows = Array.prototype.slice.call(tb.rows);
+  var dir = tb.getAttribute('data-dir-' + ci) === '1' ? -1 : 1;
+  tb.setAttribute('data-dir-' + ci, dir === 1 ? '1' : '0');
+  rows.sort(function(a, b) {
+    var x = a.cells[ci], y = b.cells[ci];
+    if (numeric) { x = parseFloat(x.getAttribute('data-v')) || 0; y = parseFloat(y.getAttribute('data-v')) || 0; }
+    else { x = x.textContent.trim(); y = y.textContent.trim(); }
+    return (x > y ? 1 : x < y ? -1 : 0) * dir;
+  });
+  rows.forEach(function(r) { tb.appendChild(r); });
+}
+Array.prototype.forEach.call(document.querySelectorAll('th[data-k]'), function(th) {
+  th.addEventListener('click', function() { sortBy(+th.dataset.k, th.dataset.n === '1'); });
+});
+function applyFilter() {
+  var q = document.getElementById('q').value.toLowerCase();
+  var b = document.getElementById('bf').value;
+  Array.prototype.forEach.call(tb.rows, function(r) {
+    r.style.display = (r.textContent.toLowerCase().indexOf(q) >= 0 &&
+                       (!b || r.getAttribute('data-brand') === b)) ? '' : 'none';
+  });
+}
+document.getElementById('q').addEventListener('input', applyFilter);
+document.getElementById('bf').addEventListener('change', applyFilter);
+</script></body></html>"""
+
+    page = (page.replace("__TASKID__", _esc(task_id or "-"))
+                .replace("__NOW__", now)
+                .replace("__MKT__", _esc(market))
+                .replace("__NCARDS__", str(len(rows)))
+                .replace("__TUNITS__", "{:,}".format(total_units))
+                .replace("__MED__", "%.2f" % med_price)
+                .replace("__NRAND__", str(len(brands)))
+                .replace("__RATING__", "%.2f" % avg_rating)
+                .replace("__CW__", str(CW)).replace("__CH__", str(CH))
+                .replace("__LINES__", "\n".join(lines))
+                .replace("__LABELS__", " ".join(labels))
+                .replace("__BOPT__", "".join("<option>%s</option>" % _esc(b) for b in brands))
+                .replace("__TRS__", trs_html))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(page)
+    return out_path
+
+
+# ---------- AI 分析包（Markdown，紧凑上下文，供外部 AI 阅读） ----------
+
+def build_ai_pack(rows, kw_rows, out_path, scope_label="ALL",
+                  top_products=200, top_keywords=150):
+    """生成预聚合的 Markdown 数据包：
+    统计摘要 + 产品层(按月销Top N) + 关键词层(标准词按综合分Top M) + 品牌聚合。
+    全文控制在 ~1-3 万 token，可直接粘贴给外部 AI。"""
+    from datetime import datetime
+    from collections import defaultdict
+    rows = sorted([r for r in rows if r.get("asin")],
+                  key=lambda r: -(r.get("totalUnits") or 0))
+    prod_rows = rows[:max(top_products, 1)]
+
+    lines = []
+    L = lines.append
+    L("# 竞品分析数据包（供 AI 阅读）")
+    L("")
+    L(f"- 生成时间: {datetime.now(CN_TZ):%Y-%m-%d %H:%M} (北京时间)")
+    L(f"- 数据范围: {scope_label} · 产品层取月销量 Top {len(prod_rows)}（共 {len(rows)} 个 ASIN）")
+    L("- 数据来源: 卖家精灵（竞品查询快照 + 广告关键词 + 关键词挖掘官方 ARA 数据），月销为平台估算值")
+    L("- ⚠️ 关键词层数据口径【务必遵守】：月搜索量/月购买量/购买率/需供比/点击量 均为"
+      "**整个关键词的市场级数据（ARA 口径）**，不代表任何竞品 ASIN 在该词上的点击率/转化率/销量；"
+      "竞品 ASIN 级信号只有两个：①覆盖竞品数=哪些竞品投了这个词（词出现在其广告组），"
+      "②广告排名=该竞品广告在该词下的搜索位次。AI 分析时不得把购买率/点击量归因到具体竞品的商品表现")
+    L("")
+
+    # 一、统计摘要
+    prices = sorted(float(r["price"]) for r in rows if isinstance(r.get("price"), (int, float)))
+    total_units = sum(r.get("totalUnits") or 0 for r in rows if isinstance(r.get("totalUnits"), (int, float)))
+    tiers = defaultdict(int)
+    for k in kw_rows:
+        tiers[k.get("_tier") or "?"] += 1
+    L("## 一、统计摘要")
+    L("")
+    L(f"- ASIN 总数 {len(rows)}，合计月销量(估) {total_units:,}")
+    if prices:
+        L(f"- 价格: 中位 ${prices[len(prices)//2]:.2f} / 最低 ${prices[0]:.2f} / 最高 ${prices[-1]:.2f}")
+    L(f"- 品牌数 {len({str(r.get('brand') or '-') for r in rows})}")
+    L(f"- 关键词漏斗: {', '.join(f'{k} {v}个' for k, v in sorted(tiers.items()))}")
+    L("")
+
+    # 二、产品层
+    L(f"## 二、产品层（月销 Top {len(prod_rows)}，按月销量降序）")
+    L("")
+    L("| ASIN | 品牌 | 价格$ | 评分 | 评分数 | 月销量 | 月销额$ | 环比% | BSR | 上架天数 | 变体 | LQS |")
+    L("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for r in prod_rows:
+        price = r.get("price")
+        price = f"{price:.2f}" if isinstance(price, (int, float)) else "-"
+        rating = r.get("rating")
+        rating = f"{rating:.1f}" if isinstance(rating, (int, float)) else "-"
+        units = "{:,}".format(r.get("totalUnits")) if isinstance(r.get("totalUnits"), (int, float)) else "-"
+        amount = "{:,.0f}".format(r.get("totalAmount")) if isinstance(r.get("totalAmount"), (int, float)) else "-"
+        growth = r.get("totalUnitsGrowth")
+        growth = f"{growth:+.1f}%" if isinstance(growth, (int, float)) else "-"
+        bsr = "{:,}".format(r.get("bsrRank")) if isinstance(r.get("bsrRank"), (int, float)) else "-"
+        title_short = str(r.get("title") or "")[:60].replace("|", "/")
+        L(f"| {r.get('asin')} | {r.get('brand') or '-'} | {price} | {rating} | "
+          f"{r.get('reviews') or '-'} | {units} | {amount} | {growth} | {bsr} | "
+          f"{r.get('availableDays') or '-'} | {r.get('variations') or '-'} | {r.get('lqs') or '-'} |")
+        L(f"  （{title_short}）")
+
+    # 三、关键词层
+    std = [k for k in kw_rows if k.get("_tier") != "品牌词"]
+    std.sort(key=lambda k: -(k.get("_score") or 0))
+    std = std[:max(top_keywords, 1)]
+    L("")
+    L(f"## 三、关键词层（标准词，按综合分 Top {len(std)}；品牌词仅列名）")
+    L("")
+    L("| 关键词 | 分层 | 月搜索量(词级) | 覆盖竞品数(ASIN级) | 综合分 | 购买率(词级) | "
+      "月购买量(词级) | 需供比(词级) | PPC$(词级) | 最佳广告排名(ASIN级) |")
+    L("|---|---|---|---|---|---|---|---|---|---|")
+    for k in std:
+        pr = k.get("购买率")
+        pr = f"{pr*100:.2f}%" if isinstance(pr, (int, float)) else "-"
+        pb = "{:,}".format(int(k["月购买量"])) if isinstance(k.get("月购买量"), (int, float)) else "-"
+        sd = f"{k.get('需供比'):.1f}" if isinstance(k.get("需供比"), (int, float)) else "-"
+        ppc = k.get("PPC价格")
+        ppc = f"{ppc:.2f}" if isinstance(ppc, (int, float)) else "-"
+        rank = k.get("广告排名")
+        rank = str(int(rank)) if isinstance(rank, (int, float)) else "-"
+        L(f"| {k.get('keyword')} | {k.get('_tier')} | {k.get('月搜索量') or '-'} | "
+          f"{k.get('_coverage')} | {k.get('_score')} | {pr} | {pb} | {sd} | {ppc} | {rank} |")
+    brand_kws = sorted({k.get("keyword") for k in kw_rows if k.get("_tier") == "品牌词"})
+    if brand_kws:
+        L("")
+        L(f"品牌词（{len(brand_kws)} 个，已单独分层）: " + "、".join(brand_kws[:80])
+          + ("…" if len(brand_kws) > 80 else ""))
+
+    # 四、品牌聚合
+    agg = defaultdict(lambda: [0, 0, []])
+    for r in rows:
+        b = str(r.get("brand") or "-")
+        agg[b][0] += 1
+        if isinstance(r.get("totalUnits"), (int, float)):
+            agg[b][1] += r["totalUnits"]
+        if isinstance(r.get("price"), (int, float)):
+            agg[b][2].append(r["price"])
+    top_brands = sorted(agg.items(), key=lambda x: -x[1][1])[:15]
+    L("")
+    L("## 四、品牌聚合（按总月销量 Top 15）")
+    L("")
+    L("| 品牌 | 产品数 | 合计月销量 | 价格区间$ |")
+    L("|---|---|---|---|")
+    for b, (n, u, ps) in top_brands:
+        pr = f"${min(ps):.0f}-{max(ps):.0f}" if ps else "-"
+        L(f"| {b} | {n} | {u:,} | {pr} |")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return out_path
+
+
 # ---------- 广告分析报告（ads-insights 关键词漏斗结果） ----------
 
 ADS_COLS = [
     ("分层", "_tier", 9, None, None),
     ("关键词", "keyword", 30, None, None),
-    ("月搜索量(最新)", "月搜索量", 13, '#,##0', None),
-    ("近3月均值", "近3月搜索量均值", 11, '#,##0', None),
-    ("搜索增长率", "搜索增长率", 11, '0.0%', None),
-    ("月购买量", "月购买量", 10, '#,##0', None),
-    ("购买率", "购买率", 9, '0.0%', None),
-    ("需供比", "需供比", 8, '0.0', None),
-    ("商品数", "商品数", 9, '#,##0', None),
-    ("PPC价格", "PPC价格", 9, None, None),
-    ("点击量", "点击量", 10, '#,##0', None),
-    ("点击总占比", "点击总占比", 11, '0.0%', None),
-    ("转化总占比", "转化总占比", 11, '0.0%', None),
-    ("ABA排名", "ABA排名", 11, '#,##0', None),
-    ("覆盖竞品数", "_coverage", 10, '0', None),
+    ("月搜索量(词级)", "月搜索量", 13, '#,##0', None),
+    ("近3月均值(词级)", "近3月搜索量均值", 11, '#,##0', None),
+    ("搜索增长率(词级)", "搜索增长率", 11, '0.0%', None),
+    ("月购买量(词级)", "月购买量", 10, '#,##0', None),
+    ("购买率(词级)", "购买率", 9, '0.0%', None),
+    ("需供比(词级)", "需供比", 8, '0.0', None),
+    ("商品数(词级)", "商品数", 9, '#,##0', None),
+    ("PPC价格(词级)", "PPC价格", 9, None, None),
+    ("点击量(词级)", "点击量", 10, '#,##0', None),
+    ("点击总占比(词级)", "点击总占比", 11, '0.0%', None),
+    ("转化总占比(词级)", "转化总占比", 11, '0.0%', None),
+    ("ABA排名(词级)", "ABA排名", 11, '#,##0', None),
+    ("覆盖竞品数(ASIN级)", "_coverage", 10, '0', None),
+    ("广告排名(ASIN级)", "广告排名", 12, '0', None),
+    ("各竞品广告排名(ASIN级)", "_ranks", 32, None,
+     lambda r: "; ".join(f"{k}:{v}" for k, v in
+                         sorted((r.get("_ranks") or {}).items(), key=lambda x: x[1]))),
     ("综合分", "_score", 9, '0.0', None),
-    ("来源", "_sources", 30, None, lambda r: ", ".join(r.get("_sources") or [])),
+    ("来源(ASIN级)", "_sources", 30, None, lambda r: ", ".join(r.get("_sources") or [])),
     ("所属类目", "所属类目", 26, None, None),
 ]
 
@@ -372,9 +693,15 @@ def build_ads_report(kept, meta, out_path, page_groups=None):
         "页内区域: 每个灰色区域标题标明该区块的广告词来自哪个竞品ASIN/来源",
         "分层: 核心词=≥3个来源都在投 / 共同词=2个来源 / 机会词=仅1个来源（结合总览'来源'列判断）",
         "综合分 = 月搜索量 × (1+覆盖竞品数) × min(需供比,10) / 1000，仅用于排序参考",
+        "⚠️ 数据口径【重要】：标注'词级'的列 = 整个关键词的市场级数据（卖家精灵关键词挖掘/ARA 口径），"
+        "与来源ASIN无关——不可解读为某竞品在该词上的点击率/转化率/销量；"
+        "补齐的官方指标（月购买量/购买率/需供比等）同样是词级市场数据",
+        "ASIN级列【仅4个】: 覆盖竞品数/来源 = 哪些竞品投了这个词（词出现在其广告组）；"
+        "广告排名(ASIN级) = 最佳竞品广告在该词下的搜索位次；各竞品广告排名 = 逐竞品明细（格式 ASIN:位次）",
         "指标口径: 导入文件与⑧关键词补齐(kw_miner)为官方值（含月购买量/购买率）；⚡抓取行中 "
         "ABA排名≈searchesRank、需供比=搜索量/商品数、点击总占比=点击量/搜索量、"
-        "转化总占比≈cvsShareRate、搜索增长率=trends月环比，均为估算",
+        "转化总占比≈cvsShareRate、搜索增长率=trends月环比，均为估算；"
+        "⚡抓取的搜索量/点击量为收割周期快照（约周级），数值≠官方月度值，勿直接对比",
         f"数据来源: {meta.get('sources') or '卖家精灵广告洞察-关键词历史导出（月粒度）'}；指标为平台估算值"
         "（⚡自动抓取部分为收割时点画像，月份=收割月）",
     ]:
@@ -391,20 +718,20 @@ CLEAN_COLS = [
     ("分层", "分层", 9, None, None),
     ("关键词", "keyword", 30, None, None),
     ("价值分", "价值分", 9, '0.000', None),
-    ("来源ASIN", "来源ASIN", 13, None, None),
-    ("广告排名", "广告排名", 10, '0', None),
-    ("搜索量", "searches", 11, '#,##0', None),
-    ("点击量", "clicks", 10, '#,##0', None),
-    ("展示量", "impressions", 11, '#,##0', None),
-    ("bid", "bid", 8, '0.00', None),
-    ("exactPpc", "exactPpc", 10, '0.00', None),
-    ("broadPpc", "broadPpc", 10, '0.00', None),
-    ("phrasePpc", "phrasePpc", 10, '0.00', None),
+    ("来源ASIN(ASIN级)", "来源ASIN", 13, None, None),
+    ("广告排名(ASIN级)", "广告排名", 10, '0', None),
+    ("搜索量(词级)", "searches", 11, '#,##0', None),
+    ("点击量(词级)", "clicks", 10, '#,##0', None),
+    ("展示量(词级)", "impressions", 11, '#,##0', None),
+    ("bid(词级)", "bid", 8, '0.00', None),
+    ("exactPpc(词级)", "exactPpc", 10, '0.00', None),
+    ("broadPpc(词级)", "broadPpc", 10, '0.00', None),
+    ("phrasePpc(词级)", "phrasePpc", 10, '0.00', None),
     ("CPR(精确)", "cprExact", 9, '0.0', None),
-    ("月购买量*", "月购买量", 11, '#,##0', None),
-    ("购买率*", "购买率", 9, '0.00%', None),
-    ("需供比*", "需供比", 9, '0.0', None),
-    ("adId", "adId", 26, None, None),
+    ("月购买量*(词级)", "月购买量", 11, '#,##0', None),
+    ("购买率*(词级)", "购买率", 9, '0.00%', None),
+    ("需供比*(词级)", "需供比", 9, '0.0', None),
+    ("adId(ASIN级)", "adId", 26, None, None),
 ]
 
 
@@ -430,7 +757,10 @@ def build_clean_report(kept, out_path):
     for line in [
         f"生成时间: {datetime.now(CN_TZ):%Y-%m-%d %H:%M:%S} (北京时间)",
         f"总词数: {len(kept)}（价值函数 v2 多因子加权：购买体量20% + 需求规模20% + 购买转化15% + "
-        "广告排名15% + 广告点击10% + 市场定价10% + 供需空间10%，批内归一，缺因子按中性值0.5计）",
+        "广告排名(ASIN)15% + 市场点击热度10% + 市场定价10% + 供需空间10%，批内归一，缺因子按中性值0.5计）",
+        "⚠️ 数据口径【重要】：搜索量/点击量/展示量/月购买量*/购买率*/需供比* 均为【词级市场数据】"
+        "（ARA/关键词挖掘口径），与来源ASIN无关——不可解读为该竞品在该词上的点击率/转化率；"
+        "ASIN级信号仅：来源ASIN（该竞品投了这个词）+ 广告排名（该竞品广告在该词的位次）+ adId",
         "带 * 列为官方 ARA 数据（关键词挖掘⑦/②补齐 或 导入文件），已参与评分；"
         "未补齐的词按其余因子归一评分，不吃亏",
         f"来源分页: {len(groups)} 个来源ASIN各一个 Sheet（按词数降序）："

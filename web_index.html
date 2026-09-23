@@ -65,12 +65,23 @@
   }
   .muted { color: var(--muted); font-size: 12.5px; }
   .flex { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-  input[type=number] {
-    width: 90px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 14px;
+  input[type=text], input[type=number], textarea, select.sel {
+    border: 1px solid var(--line); border-radius: 8px; background: #fbfcfe;
+    padding: 9px 12px; font-size: 13.5px; color: var(--text); font-family: inherit;
+    transition: border-color .15s, box-shadow .15s, background .15s; outline: none;
   }
+  input[type=text]:hover, input[type=number]:hover, textarea:hover, select.sel:hover {
+    border-color: #d3d9e4; background: #fff;
+  }
+  input[type=text]:focus, input[type=number]:focus, textarea:focus, select.sel:focus {
+    border-color: var(--orange); background: #fff; box-shadow: 0 0 0 3px rgba(255,122,26,.15);
+  }
+  input::placeholder, textarea::placeholder { color: #a9b1c2; }
+  textarea { resize: vertical; min-height: 66px; line-height: 1.6; width: 100%; }
+  input[type=number] { width: 90px; }
   select.sel {
-    padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 14px;
-    background: #fff; color: var(--text); font-family: inherit;
+    background: #fff url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238a94a6' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 10px center;
+    appearance: none; padding-right: 28px; cursor: pointer;
   }
   .toast {
     position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
@@ -84,6 +95,37 @@
   }
   a.dl { color: var(--orange-dark); font-weight: 600; text-decoration: none; }
   a.dl:hover { text-decoration: underline; }
+  /* 名单来源胶囊 */
+  #wl-list { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px; padding: 5px 13px;
+    border-radius: 20px; font-size: 12.5px; border: 1px solid var(--line);
+    background: #fbfcfe; color: var(--text); cursor: default; transition: .15s;
+  }
+  .pill:hover { transform: translateY(-1px); box-shadow: 0 2px 8px rgba(38,48,62,.10); }
+  .pill b { font-size: 12.5px; color: var(--text); }
+  .pill.self { background: #fff4ea; border-color: #ffd9b8; }
+  .pill.self b { color: var(--orange-dark); }
+  .pill.bsr  { background: #e6f7ef; border-color: #bfe8d5; }
+  .pill.bsr b { color: var(--green); }
+  .pill.top  { background: #eef2ff; border-color: #d7defa; }
+  .pill.top b { color: #4a63c8; }
+  .pill.man  { background: #f3ecff; border-color: #e0d2fb; }
+  .pill.man b { color: #8250df; }
+  .pill.blk  { background: #26303e; border-color: #26303e; color: #cfd6e2; }
+  .pill.blk b { color: #9aa6b8; text-decoration: line-through; }
+  .pill { cursor: pointer; }
+  .pill.active { border-color: var(--orange); box-shadow: 0 0 0 3px rgba(255,122,26,.15); }
+  #wl-detail {
+    display: none; margin-top: 8px; border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; background: #fbfcfe;
+  }
+  .wl-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; max-height: 190px; overflow-y: auto; }
+  .wl-chip {
+    font: 12px Consolas, monospace; padding: 3px 9px; border-radius: 6px; background: #fff;
+    border: 1px solid var(--line); color: var(--text); text-decoration: none; transition: .12s;
+  }
+  .wl-chip:hover { border-color: var(--orange); color: var(--orange-dark); }
   /* 💡 提示工具 */
   .tip { position: relative; display: inline-flex; cursor: help; font-size: 15px; line-height: 1;
          filter: saturate(.9); }
@@ -183,6 +225,37 @@
       <button id="btn-lookup" onclick="startLookup()" disabled>开始批量查询</button>
       <span class="muted">查询在服务端后台执行，可随时刷新本页查看进度</span>
     </div>
+    <div style="margin-top:10px;">
+      <label>手动 ASIN 查询（自有/零散 ASIN，逗号、空格或换行分隔，查询后自动入库 deepdive.db）<textarea
+        id="manual-asins" rows="3" placeholder="B0H4W51ZMH, B0HBPT6N7H&#10;每行一个或逗号分隔，10 位字母数字"
+        style="width:100%;margin-top:4px;"></textarea></label>
+      <div class="muted" id="manual-hint" style="margin-top:2px;">粘贴后可直接点"开始批量查询"，无需先跑③提取</div>
+    </div>
+    <div style="margin-top:10px;border-top:1px dashed var(--line);padding-top:10px;">
+      <b>📋 监控名单</b> <span id="wl-count" class="badge no">未加载</span>
+      <button onclick="loadWatchlist()">刷新名单</button>
+      <button onclick="runWatchlist()">按名单查询并入库</button>
+      <span class="muted">名单 = 自家全部 ASIN + 各类目 BSR 榜 TOP50 + 手动补充（deep_results/watchlist.json）</span>
+      <div class="flex" style="margin-top:6px;">
+        <input type="text" id="wl-add" placeholder="补充零散 ASIN，逗号分隔" style="flex:1;">
+        <button onclick="addWatchlist()">加入名单</button>
+      </div>
+      <div class="flex" style="margin-top:6px;">
+        <input type="text" id="src-url" placeholder="Amazon 类目 BSR 页 URL（保存后长期使用，每日例跑自动刷新）" style="flex:1;">
+        <input type="text" id="src-name" placeholder="备注名称" style="width:110px;">
+        <input type="number" id="src-n" value="50" min="10" max="100" title="取前N名">
+        <button class="ghost" onclick="addSource()">➕ 保存为长期榜单</button>
+      </div>
+      <div id="src-list" style="margin-top:6px;display:none;"></div>
+      <div class="flex" style="margin-top:6px;">
+        <button id="btn-bsr-probe" onclick="bsrProbe()">🛰 打开官网·捕获类目BSR榜</button>
+        <button onclick="bsrRefresh()">刷新实时BSR榜</button>
+        <span class="muted" id="bsr-status">实时榜未接入（库内 TOP50 兜底）</span>
+      </div>
+      <div id="bsr-captures" style="margin-top:6px;display:none;"></div>
+      <div id="wl-list" class="asins-preview" style="display:none;"></div>
+      <div id="wl-detail"></div>
+    </div>
     <div class="bar"><i id="bar"></i></div>
     <div class="muted" id="prog-text">尚未开始</div>
     <div id="log" class="log" style="margin-top:12px;">等待任务…</div>
@@ -190,11 +263,30 @@
   </div>
 
   <div class="card">
+    <h2><span class="num">4⁺</span>每日例跑（一键，按星期自动排任务）
+      <span id="routine-badge" class="badge no">未加载</span></h2>
+    <div class="flex">
+      <span class="muted" id="routine-plan">加载中…</span>
+      <button id="btn-routine" onclick="runRoutine()">📅 一键今日例跑</button>
+      <span class="tip">💡<span class="tipbox">每天点一次即可：④监控名单快照 → ⑦官方指标补齐100词 → CL找竞品（周一~四各1个固定种子，周五新品类探边需在 routine.json 填种子）→ 周五加跑 ⑥广告收割 + 周报归档。CL 每次消耗 5 额度；阶段失败多为会话失效，重新登录后明天自动重试。任务可在 deep_results/routine.json 自定义。</span></span>
+    </div>
+    <div class="bar"><i id="routine-bar"></i></div>
+    <div class="muted" id="routine-prog">尚未运行</div>
+    <div id="routine-log" class="log" style="margin-top:12px;">等待任务…</div>
+  </div>
+
+  <div class="card">
     <h2><span class="num">5</span>美化报告（从本地数据库生成）
       <span id="db-meta" class="muted"></span></h2>
     <div class="flex">
+      <label>范围 <select id="report-scope" class="sel">
+        <option value="current">当前分析</option>
+        <option value="global">全部数据</option>
+      </select></label>
       <button id="btn-report" onclick="genReport()">生成美化 Excel</button>
-      <span class="tip">💡<span class="tipbox">从本地 SQLite 读取全部查询快照（跨批次累积、去重取最新）。输出四个 Sheet：<ul><li><b>总览</b>：中文字段 + 数据条 + 色阶 + 商品/图片超链接</li><li><b>销量趋势(月)</b>：近18个月销量矩阵</li><li><b>原始数据</b>：129 字段全量</li><li><b>说明</b>：生成信息与指标口径</li></ul></span></span>
+      <button id="btn-report-html" onclick="genReportHtml()">🌐 生成 HTML 报告</button>
+      <button id="btn-aipack" onclick="genAiPack()">🤖 AI 分析包</button>
+      <span class="tip">💡<span class="tipbox">范围：<b>当前分析</b> = 本次批量查询的数据（未跑④时用当前任务 ASIN 的最新快照）；<b>全部数据</b> = 本地库所有历史批次。<ul><li><b>🌐 HTML 版</b>：阅读视图——统计卡片 + 销量趋势图 + 可排序/筛选/缩略图的交互表格，单文件可直接转发/手机看</li><li><b>xlsx 版</b>：计算视图——129 字段原始数据，供透视/公式深加工</li><li><b>注意</b>：第④步的"下载Excel报告"永远是本次查询的原始返回，与本处范围无关</li></ul></span></span>
       <a id="dl2" class="dl" style="display:none;" href="#">⬇ 下载美化报告</a>
     </div>
   </div>
@@ -207,7 +299,7 @@
       <button id="btn-ads" onclick="genAdsReport()">② 广告分析报告（全部历史）</button>
       <button id="btn-ads-cur" onclick="genAdsReport('current')">②⁺ 仅当前分析</button>
       <button onclick="cleanAds()">③ 生成高相关词清单</button>
-      <span class="tip">💡<span class="tipbox"><ul><li><b>② 全部历史</b>：数据源 = ⚡自动抓取入库的广告词 + ①导入的导出文件（可选，放入 adv_reserach/ 后点①）。分页按"我分析的ASIN"一页一个分析对象，页内灰色区域标题标明每块词来自哪个竞品；归属不到任务的进"其他来源"页，导入种子词进"导入来源"页</li><li><b>②⁺ 仅当前分析</b>：只统计当前任务那批竞品的广告词（导入文件不混入），覆盖数/分层只在这批竞品内计算——适合看"这一轮分析能用哪些词"</li><li><b>③ 高相关词清单</b>：价值函数 v2 多因子加权——购买体量20% + 需求规模20% + 购买转化15% + 广告排名15% + 广告点击10% + 市场定价10% + 供需空间10%（批内归一，缺因子按中性值计，无品类经验）；品牌词（按本地库品牌表）单独分层，不剔除任何词</li></ul></span></span>
+      <span class="tip">💡<span class="tipbox"><ul><li><b>② 全部历史</b>：数据源 = ⚡自动抓取入库的广告词 + ①导入的导出文件（可选，放入 adv_reserach/ 后点①）。分页按"我分析的ASIN"一页一个分析对象，页内灰色区域标题标明每块词来自哪个竞品；归属不到任务的进"其他来源"页，导入种子词进"导入来源"页</li><li><b>②⁺ 仅当前分析</b>：只统计当前任务那批竞品的广告词（导入文件不混入），覆盖数/分层只在这批竞品内计算——适合看"这一轮分析能用哪些词"</li><li><b>③ 高相关词清单</b>：价值函数 v2 多因子加权——购买体量20% + 需求规模20% + 购买转化15% + 广告排名(ASIN)15% + 市场点击热度10% + 市场定价10% + 供需空间10%（批内归一，缺因子按中性值计，无品类经验）；<b>⚠️ 口径：官方指标与搜索/点击量均为词级市场数据，不代表竞品在该词上的表现；ASIN 级信号仅广告排名与来源归属</b>；品牌词（按本地库品牌表）单独分层，不剔除任何词</li></ul></span></span>
       <a id="dl3" class="dl" style="display:none;" href="#">⬇ 下载广告报告</a>
     </div>
     <div class="flex" style="margin-top:10px;">
@@ -233,7 +325,7 @@
         placeholder="每行一个关键词（逗号分隔也可以），自动按每批20词切分。例：&#10;portable power station&#10;solar generator for home"></textarea>
       <div class="flex">
         <button id="btn-kwminer" onclick="runKwMiner()">🔍 批量查询并入库（关键词挖掘·官方数据）</button>
-        <span class="tip">💡<span class="tipbox">数据源 = 卖家精灵"关键词挖掘-批量分析"接口（免费会员可用），官方 ARA 数据：<b>月购买量 / 购买率 / ABA排名 / 需供比 / 转化总占比 / 逐月趋势</b>。<ul><li><b>入库即生效</b>：重新生成②报告，官方值自动补上</li><li><b>②自动补齐</b>：在②勾选后，报告<b>全体保留词</b>自动走本链路（综合分降序，跳过已查过的词，后台执行、逐批入库）</li><li><b>账号池</b>：可添加多个主账号，每批(20词)自动轮换分摊，会话失效自动跳过</li><li><b>频控</b>：批间随机等待 3-6 秒不变；单次最多 100 词</li></ul></span></span>
+        <span class="tip">💡<span class="tipbox">数据源 = 卖家精灵"关键词挖掘-批量分析"接口（免费会员可用），官方 ARA 数据：<b>月购买量 / 购买率 / ABA排名 / 需供比 / 转化总占比 / 逐月趋势</b>（⚠️ 均为<b>词级市场数据</b>，与 ASIN 无关，不可解读为某竞品在该词上的转化表现）。<ul><li><b>入库即生效</b>：重新生成②报告，官方值自动补上</li><li><b>②自动补齐</b>：在②勾选后，报告<b>全体保留词</b>自动走本链路（综合分降序，跳过已查过的词，后台执行、逐批入库）</li><li><b>账号池</b>：可添加多个主账号，每批(20词)自动轮换分摊，会话失效自动跳过</li><li><b>频控</b>：批间随机等待 3-6 秒不变；单次最多 100 词</li></ul></span></span>
       </div>
       <div class="flex" style="margin-top:10px;">
         <span class="muted">主账号池（每批轮换分摊）：</span>
@@ -289,15 +381,44 @@ async function refreshAccounts() {
   } catch (e) { toast('账号状态获取失败: ' + e.message); }
 }
 
+async function genAiPack() {
+  const btn = $('btn-aipack');
+  btn.disabled = true; btn.textContent = '生成中…';
+  try {
+    const r = await api('/api/ai_pack', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: $('report-scope').value }) });
+    $('dl2').style.display = 'inline';
+    $('dl2').href = '/api/report/download';
+    $('dl2').textContent = `⬇ 下载 AI 分析包（${r.file}）`;
+    toast(`✅ AI 分析包已生成（${r.count} 产品 / ${r.kept_kw} 词，约 ${r.est_tokens}k tokens）——直接把 .md 内容粘贴给外部 AI`, 6000);
+  } catch (e) { toast(e.message); }
+  btn.disabled = false; btn.textContent = '🤖 AI 分析包';
+}
+
+async function genReportHtml() {
+  const btn = $('btn-report-html');
+  btn.disabled = true; btn.textContent = '生成中…';
+  try {
+    const r = await api('/api/report_html', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: $('report-scope').value }) });
+    $('dl2').style.display = 'inline';
+    $('dl2').href = '/api/report/download';
+    $('dl2').textContent = `⬇ 下载 HTML 报告（${r.scope === 'global' ? '全部' : '当前'}·${r.count} 个产品）`;
+    toast(`✅ HTML 报告已生成（${r.scope === 'global' ? '全部数据' : '当前分析'}，${r.count} 个产品）`);
+  } catch (e) { toast(e.message); }
+  btn.disabled = false; btn.textContent = '🌐 生成 HTML 报告';
+}
+
 async function genReport() {
   const btn = $('btn-report');
   btn.disabled = true; btn.textContent = '生成中…';
   try {
-    const r = await api('/api/report', { method: 'POST' });
+    const r = await api('/api/report', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: $('report-scope').value }) });
     $('dl2').style.display = 'inline';
     $('dl2').href = '/api/report/download';
-    $('dl2').textContent = `⬇ 下载美化报告（${r.count} 个产品）`;
-    toast('✅ 美化报告已生成');
+    $('dl2').textContent = `⬇ 下载美化报告（${r.scope === 'global' ? '全部' : '当前'}·${r.count} 个产品）`;
+    toast(`✅ 美化报告已生成（${r.scope === 'global' ? '全部数据' : '当前分析'}，${r.count} 个产品）`);
   } catch (e) { toast(e.message); }
   btn.disabled = false; btn.textContent = '生成美化 Excel';
 }
@@ -409,13 +530,308 @@ async function extractAsins() {
 
 async function startLookup() {
   try {
+    const manual = ($('manual-asins').value || '').trim();
+    const body = { chunk: parseInt($('chunk').value) || 20 };
+    if (manual) body.asins = manual;
     const r = await api('/api/lookup', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chunk: parseInt($('chunk').value) || 20 })
+      body: JSON.stringify(body)
     });
     jobId = r.job_id;
     $('btn-lookup').disabled = true;
     $('log').textContent = '';
+    if (r.mode === 'manual') $('asins-meta').textContent = `手动模式 · ${r.asins} 个 ASIN · 批次 ${r.label}`;
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(pollJob, 1500);
+  } catch (e) { toast(e.message); }
+}
+
+async function loadRoutinePlan() {
+  try {
+    const r = await api('/api/routine/plan');
+    const b = $('routine-badge');
+    b.textContent = `${r.weekday} · ${r.plan.length} 项`;
+    b.className = 'badge ok';
+    $('routine-plan').textContent = `今日 ${r.date}（${r.weekday}）计划：${r.plan.join(' → ')}`
+      + (r.cl_seed ? '' : ' · CL 今日不跑');
+  } catch (e) { $('routine-plan').textContent = '计划加载失败: ' + e.message; }
+}
+
+let routineTimer = null, routineJobId = null;
+
+async function runRoutine() {
+  try {
+    const r = await api('/api/routine/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    routineJobId = r.job_id;
+    $('btn-routine').disabled = true;
+    $('routine-log').textContent = '';
+    if (routineTimer) clearInterval(routineTimer);
+    routineTimer = setInterval(pollRoutine, 2000);
+  } catch (e) { toast(e.message); }
+}
+
+async function pollRoutine() {
+  if (!routineJobId) return;
+  try {
+    const j = await api(`/api/job/${routineJobId}`);
+    $('routine-bar').style.width = (j.pct || 0) + '%';
+    $('routine-prog').textContent = `${j.detail || ''} · ${j.pct || 0}% · 状态 ${j.status}`;
+    $('routine-log').textContent = (j.log || []).join('\n');
+    $('routine-log').scrollTop = $('routine-log').scrollHeight;
+    if (j.status !== 'running') {
+      clearInterval(routineTimer); routineTimer = null; routineJobId = null;
+      $('btn-routine').disabled = false;
+      loadRoutinePlan();
+      toast(j.status === 'done' ? '📅 例跑结束，看日志确认各阶段' : '例跑异常，看日志');
+    }
+  } catch (e) { clearInterval(routineTimer); routineTimer = null; routineJobId = null; $('btn-routine').disabled = false; toast('轮询失败: ' + e.message); }
+}
+
+let wlItems = [], wlOpen = null, wlBlocked = [];
+
+function toggleWlDetail(source) {
+  wlOpen = (wlOpen === source) ? null : source;
+  const box = $('wl-detail');
+  if (!wlOpen) { box.style.display = 'none'; box.innerHTML = ''; }
+  else {
+    const items = wlItems.filter(i => i.source === source);
+    const isBlk = (wlBlocked || []).includes(source);
+    box.style.display = 'block';
+    box.innerHTML = `<div class="flex" style="justify-content:space-between;">
+        <b>${source} · ${items.length} 个 ASIN（点击编号直达 Amazon 页面）</b>
+        <button class="sm ghost" onclick="toggleWlDetail('${source}')">收起</button>
+      </div>` + (isBlk ? `<div class="muted" style="margin-top:6px;">🚫 该来源已屏蔽——不参与④查询/例跑，右键胶囊可恢复</div>` : '')
+      + `<div class="wl-chips">` + items.map(i =>
+        `<a class="wl-chip" href="https://www.amazon.com/dp/${i.asin}" target="_blank"
+           title="${(i.note || '').replace(/"/g, '')}">${i.asin}</a>`).join('') + `</div>`;
+  }
+  document.querySelectorAll('#wl-list .pill').forEach(p =>
+    p.classList.toggle('active', p.getAttribute('data-src') === wlOpen));
+}
+
+async function toggleBlock(source) {
+  try {
+    const r = await api('/api/watchlist/block', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source })
+    });
+    toast(r.blocked ? `🚫 已屏蔽「${source}」——不参与查询` : `✅ 已恢复「${source}」`);
+    loadWatchlist();
+  } catch (e) { toast(e.message); }
+}
+
+async function loadWatchlist() {
+  try {
+    const r = await api('/api/watchlist');
+    wlItems = r.items || [];
+    wlBlocked = Object.keys(r.blocked || {});
+    wlOpen = null;
+    $('wl-detail').style.display = 'none';
+    const el = $('wl-count');
+    el.textContent = `${r.count} 个（自家 ${r.own}）`;
+    el.className = 'badge ok';
+    const pv = $('wl-list');
+    pv.style.display = 'flex';
+    const groups = {};
+    wlItems.forEach(i => { groups[i.source] = (groups[i.source] || 0) + 1; });
+    Object.entries(r.blocked || {}).forEach(([k, v]) => { groups[k] = v; });
+    const cls = s => (wlBlocked.includes(s) ? 'blk' :
+      s === '自家' || s.startsWith('自家·') ? 'self'
+      : s.startsWith('BSR') ? 'bsr' : s.startsWith('TOP') ? 'top' : 'man');
+    const short = s => s.replace('BSR榜·', 'BSR·');
+    pv.innerHTML = Object.entries(groups).map(([k, v]) =>
+      `<span class="pill ${cls(k)}" data-src="${k}"
+         onclick="toggleWlDetail('${k}')"
+         oncontextmenu="toggleBlock('${k}');return false;"
+         title="左键查看明细 · 右键屏蔽/恢复（屏蔽后不参与查询）">${short(k)} <b>${v}</b></span>`).join('');
+    const st = $('bsr-status');
+    const tsEntries = Object.entries(r.bsr_ts || {});
+    if (tsEntries.length) {
+      st.textContent = '实时榜: ' + tsEntries.map(([n, t]) => `${n}@${(t || '').slice(5, 16)}`).join(' / ');
+    } else st.textContent = '实时榜未接入（库内 TOP50 兜底）';
+  } catch (e) { toast('名单加载失败: ' + e.message); }
+}
+
+let bsrCaptures = [], bsrCats = [], bsrTimer = null, bsrJobId = null;
+
+let amzTimer = null, amzJobId = null;
+
+async function loadSources() {
+  try {
+    const r = await api('/api/bsr/sources');
+    const box = $('src-list');
+    if (!r.items.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+    box.style.display = 'block';
+    box.innerHTML = r.items.map(s => {
+      const host = (s.url || '').replace(/^https:\/\/www\.amazon\.com/, '').slice(0, 42);
+      const ts = s.ts ? s.ts.slice(5, 16) : '未抓取';
+      return `<div class="flex" style="margin:2px 0;padding:6px 10px;border:1px solid var(--line);border-radius:8px;">
+        <b>🏷 ${s.category}</b><span class="muted">${s.count || 0} 个 · ${ts} · ${host}… · Top${s.n}</span>
+        <button class="sm" onclick="refreshSource('${s.category}')">🔄 刷新</button>
+        <button class="sm ghost" onclick="removeSource('${s.category}')">删除</button>
+      </div>`;
+    }).join('');
+  } catch (e) { toast('榜单源加载失败: ' + e.message); }
+}
+
+async function addSource() {
+  const url = ($('src-url').value || '').trim();
+  const category = ($('src-name').value || '').trim();
+  if (!url || !category) return toast('URL 和备注名称都要填');
+  try {
+    await api('/api/bsr/sources/add', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, category, n: parseInt($('src-n').value) || 50 })
+    });
+    $('src-url').value = ''; $('src-name').value = '';
+    toast(`✅ 已保存长期榜单「${category}」`);
+    loadSources();
+  } catch (e) { toast(e.message); }
+}
+
+async function removeSource(category) {
+  if (!confirm(`删除长期榜单「${category}」？（已入库数据不受影响）`)) return;
+  try {
+    await api('/api/bsr/sources/remove', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category })
+    });
+    loadSources(); loadWatchlist();
+  } catch (e) { toast(e.message); }
+}
+
+async function refreshSource(category) {
+  try {
+    const r = await api('/api/bsr/sources');
+    const s = (r.items || []).find(x => x.category === category);
+    if (!s) return toast('榜单源不存在');
+    const res = await api('/api/watchlist/bsr/amazon', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: s.url, category, n: s.n })
+    });
+    amzJobId = res.job_id;
+    $('bsr-status').textContent = `「${category}」刷新中…`;
+    if (amzTimer) clearInterval(amzTimer);
+    amzTimer = setInterval(pollAmz, 2000);
+  } catch (e) { toast(e.message); }
+}
+
+async function pollAmz() {
+  if (!amzJobId) return;
+  try {
+    const j = await api(`/api/job/${amzJobId}`);
+    $('bsr-status').textContent = j.detail || j.status;
+    if (j.status !== 'running') {
+      clearInterval(amzTimer); amzTimer = null; amzJobId = null;
+      loadSources(); loadWatchlist();
+      toast(j.status === 'done' ? '✅ ' + (j.log || []).slice(-2).join(' ') : '失败：' + (j.log || []).slice(-1).join(''));
+    }
+  } catch (e) { clearInterval(amzTimer); amzTimer = null; toast('轮询失败: ' + e.message); }
+}
+
+async function bsrProbe() {
+  if (!confirm('将打开一个可见的浏览器窗口（带登录态）：\n像官网一样点选类目→查询，可连续查多个类目；\n操作完直接关闭那个窗口即结束捕获（不关则最长5分钟）。继续？')) return;
+  try {
+    const r = await api('/api/watchlist/bsr/probe', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ seconds: 300 })
+    });
+    bsrJobId = r.job_id;
+    $('btn-bsr-probe').disabled = true;
+    $('bsr-status').textContent = '捕获中…请在弹出的窗口里选类目→查询';
+    if (bsrTimer) clearInterval(bsrTimer);
+    bsrTimer = setInterval(pollBsr, 2000);
+  } catch (e) { toast('启动失败: ' + e.message); }
+}
+
+async function pollBsr() {
+  if (!bsrJobId) return;
+  try {
+    const j = await api(`/api/job/${bsrJobId}`);
+    $('bsr-status').textContent = `${j.detail || j.status} · ${j.pct || 0}%`;
+    if (j.log && j.log.length) $('bsr-status').title = j.log.join('\n');
+    if (j.status !== 'running') {
+      clearInterval(bsrTimer); bsrTimer = null; bsrJobId = null;
+      $('btn-bsr-probe').disabled = false;
+      if (j.status === 'done') {
+        bsrCaptures = j.captures || [];
+        const wl = await api('/api/watchlist');
+        bsrCats = (wl.categories || []).map(c => c.name);
+        renderCaptures();
+        loadWatchlist();
+        toast(`✅ 捕获 ${bsrCaptures.length} 个类目榜，详见名单区`);
+      } else toast('捕获失败：' + (j.log || []).slice(-2).join(' | '));
+    }
+  } catch (e) { clearInterval(bsrTimer); bsrTimer = null; $('btn-bsr-probe').disabled = false; toast('轮询失败: ' + e.message); }
+}
+
+function renderCaptures() {
+  const box = $('bsr-captures');
+  if (!bsrCaptures.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  box.style.display = 'block';
+  box.innerHTML = bsrCaptures.map((c, i) => {
+    const short = c.label.length > 60 ? c.label.slice(0, 60) + '…' : c.label;
+    if (c.category) return `<div class="muted">✅ ${short}（${c.rows}行）→ 已绑定「${c.category}」</div>`;
+    const opts = bsrCats.map(n => `<option value="${n}">${n}</option>`).join('')
+      + `<option value="__raw">＋新建类目「${c.label.slice(0, 20)}…」</option>`;
+    return `<div class="flex" style="margin:2px 0;">📄 ${short}（${c.rows}行）
+      <select id="bsr-map-${i}" class="sel">${opts}</select>
+      <button onclick="assignCapture(${i})">绑定</button></div>`;
+  }).join('');
+}
+
+async function assignCapture(i) {
+  const sel = document.getElementById('bsr-map-' + i);
+  const category = sel.value === '__raw' ? bsrCaptures[i].label : sel.value;
+  try {
+    const r = await api('/api/watchlist/bsr/assign', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: bsrCaptures[i].label, category })
+    });
+    bsrCaptures[i].category = r.category;
+    bsrCats = bsrCats.includes(r.category) ? bsrCats : bsrCats.concat([r.category]);
+    renderCaptures();
+    loadWatchlist();
+    toast(`✅ 已绑定「${r.category}」，点「刷新实时BSR榜」立即拉取`);
+  } catch (e) { toast(e.message); }
+}
+
+async function bsrRefresh() {
+  try {
+    const r = await api('/api/watchlist/bsr/refresh', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    toast(r.ok ? `✅ 实时BSR刷新：${r.summary}` : r.note);
+    loadWatchlist();
+  } catch (e) { toast(e.message); }
+}
+
+async function addWatchlist() {
+  const v = ($('wl-add').value || '').trim();
+  if (!v) return toast('先填 ASIN');
+  try {
+    const r = await api('/api/watchlist/add', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ asins: v })
+    });
+    $('wl-add').value = '';
+    toast(`✅ 新增 ${r.added} 个，名单共 ${r.count} 个`);
+    loadWatchlist();
+  } catch (e) { toast(e.message); }
+}
+
+async function runWatchlist() {
+  try {
+    const r = await api('/api/watchlist/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chunk: parseInt($('chunk').value) || 150 })
+    });
+    jobId = r.job_id;
+    $('btn-lookup').disabled = true;
+    $('log').textContent = '';
+    $('asins-meta').textContent = `监控名单例跑 · ${r.asins} 个 ASIN · 批次 ${r.label}`;
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollJob, 1500);
   } catch (e) { toast(e.message); }
@@ -636,6 +1052,14 @@ async function pollAds() {
 
 refreshAccounts();
 loadPool();
+loadWatchlist();
+loadSources();
+loadRoutinePlan();
+// ④ 手动 ASIN：输入框有内容即可开始查询（不依赖③提取）
+$('manual-asins').addEventListener('input', () => {
+  const has = ($('manual-asins').value || '').trim().length > 0;
+  if (has) $('btn-lookup').disabled = false;
+});
 </script>
 </body>
 </html>
