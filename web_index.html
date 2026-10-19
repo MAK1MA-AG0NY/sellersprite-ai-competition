@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>卖家精灵 · 竞品深挖控制台</title>
+<title>竞品研究 · 卖家精灵 / Amazon US 价格巡查</title>
 <style>
   :root {
     --orange: #ff7a1a; --orange-dark: #e8620a; --bg: #f5f6fa;
@@ -149,14 +149,53 @@
     display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line);
     border-radius: 8px; padding: 4px 8px; font-size: 12.5px; background: #fafbfe;
   }
+  /* 两个独立工作区；仅隐藏界面，不停止已运行的后台任务或轮询。 */
+  .amz-tabs { max-width: 1180px; margin: 0 auto; padding: 18px 20px 0; display: flex; gap: 10px; flex-wrap: wrap; }
+  .amz-tab { display: inline-block; padding: 10px 18px; border-radius: 9px; border: 1px solid var(--line);
+             background: #fff; color: var(--text); text-decoration: none; font-size: 14px; }
+  .amz-tab:hover { border-color: var(--orange); color: var(--orange-dark); }
+  .amz-tab[aria-selected=true] { background: var(--orange); border-color: var(--orange); color: #fff; font-weight: 600; }
+  .amz-tab:focus-visible { outline: 3px solid #ffc18f; outline-offset: 3px; }
+  .amz-page[hidden] { display: none !important; }
+  .amz-heading { font-size: 20px; margin-bottom: 7px; }
+  .amz-note { font-size: 12.5px; line-height: 1.8; color: #657084; }
+  .amz-controls { margin-top: 12px; }
+  .amz-notice { margin-top: 10px; line-height: 1.7; }
+  .amz-error { color: var(--red); }
+  .amz-ok { color: var(--green); }
+  .amz-warning { color: var(--orange-dark); }
+  .amz-table-wrap { overflow-x: auto; margin-top: 12px; }
+  .amz-table { min-width: 650px; }
+  .amz-table td { vertical-align: top; line-height: 1.65; overflow-wrap: anywhere; }
+  .amz-table tr:hover td { cursor: default; }
+  .amz-current-table { min-width: 1360px; }
+  .amz-current-table th { white-space: nowrap; }
+  .amz-current-table td { min-width: 100px; max-width: 240px; white-space: pre-wrap; }
+  .amz-current-table td.amz-title { min-width: 190px; }
+  .amz-changes { margin: 0; padding-left: 18px; min-width: 240px; }
+  .amz-changes li { margin-bottom: 4px; white-space: pre-wrap; }
+  .amz-job-detail { min-height: 20px; margin-top: 6px; white-space: pre-wrap; }
+  @media (max-width: 640px) {
+    header { padding: 22px 20px; }
+    .amz-tabs { padding-left: 12px; padding-right: 12px; }
+    .amz-page { padding: 20px 12px 40px; }
+    .amz-page > .card { padding: 18px 14px; }
+    .amz-page > .row > .card { min-width: 0; flex-basis: 100%; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>卖家精灵 · 竞品深挖控制台</h1>
-  <p>AI找竞品(主账号, 可换号) → 提取竞品ASIN → 竞品详情批量查询(会员账号) → Excel 导出</p>
+  <h1>竞品研究工作台</h1>
+  <p>卖家精灵竞品深挖 · Amazon US 手动价格巡查 · 两个独立工作区</p>
 </header>
-<div class="wrap">
+<nav class="amz-tabs" role="tablist" aria-label="工作区">
+  <a id="amzTabSellersprite" class="amz-tab" href="#sellersprite" role="tab" aria-controls="amzPanelSellersprite" aria-selected="false">卖家精灵</a>
+  <a id="amzTabAmazon" class="amz-tab" href="#amazon" role="tab" aria-controls="amzPanelAmazon" aria-selected="false">Amazon US 价格巡查</a>
+</nav>
+<section id="amzPanelSellersprite" class="wrap amz-page" role="tabpanel" aria-labelledby="amzTabSellersprite" hidden>
+  <h2 class="amz-heading">卖家精灵 · 竞品深挖控制台</h2>
+  <p class="amz-note" style="margin-bottom:20px;">AI找竞品(主账号, 可换号) → 提取竞品ASIN → 竞品详情批量查询(会员账号) → Excel 导出</p>
 
   <div class="row">
     <div class="card">
@@ -235,7 +274,7 @@
       <b>📋 监控名单</b> <span id="wl-count" class="badge no">未加载</span>
       <button onclick="loadWatchlist()">刷新名单</button>
       <button onclick="runWatchlist()">按名单查询并入库</button>
-      <span class="muted">名单 = 自家全部 ASIN + 各类目 BSR 榜 TOP50 + 手动补充（deep_results/watchlist.json）</span>
+      <span class="muted">名单 = FOSSIBOT US 在售手机清单 + 数据库自家 ASIN + 各类目 BSR 榜 + 手动补充（deep_results/watchlist.json）</span>
       <div class="flex" style="margin-top:6px;">
         <input type="text" id="wl-add" placeholder="补充零散 ASIN，逗号分隔" style="flex:1;">
         <button onclick="addWatchlist()">加入名单</button>
@@ -344,7 +383,73 @@
     </div>
   </div>
 
-</div>
+</section>
+
+<section id="amzPanelAmazon" class="wrap amz-page" role="tabpanel" aria-labelledby="amzTabAmazon" hidden>
+  <h2 class="amz-heading">Amazon US · 手动价格巡查</h2>
+  <p class="amz-note">仅查看匿名浏览环境下可见的 Amazon US 商品信息，MVP 固定配送邮编 10001；不登录 Amazon、不请求卖家精灵、不自动运行采集。首次有效读取建立基线，后续只记录明确差异。</p>
+
+  <div class="card">
+    <h2>巡查名单 <span id="amzWatchMeta" class="muted">尚未加载</span></h2>
+    <label for="amzAsins" class="amz-note">ASIN（逗号或换行分隔，最多 20 个；自动去重，每个为 10 位字母或数字）</label>
+    <textarea id="amzAsins" rows="4" placeholder="例如：B0H4W51ZMH&#10;B0HBPT6N7H" spellcheck="false" style="margin-top:7px;" disabled></textarea>
+    <div id="amzInputMeta" class="muted" style="margin-top:6px;">保存名单不会启动巡查；已有 ASIN 的基线会保留。</div>
+    <div class="flex amz-controls">
+      <button id="amzSaveBtn" type="button" class="ghost" onclick="amzSaveWatch()" disabled>保存名单</button>
+      <button id="amzRunBtn" type="button" onclick="amzRunPrice()" disabled>开始巡查</button>
+      <button id="amzReloadBtn" type="button" class="ghost" onclick="amzReload()">刷新状态 / 接续任务</button>
+      <button id="amzScheduleBtn" type="button" title="MVP 仅支持人工触发，未启用 Windows 定时任务" disabled>Windows 定时 · 暂未开放</button>
+    </div>
+    <div id="amzWatchNotice" class="muted amz-notice" role="status" aria-live="polite">进入本页后加载已保存名单。</div>
+    <p class="amz-note amz-notice">购买价 price 与划线参考价 reference_price 分开记录（美元规范字符串，如 299.00）。Coupon / 促销只保留页面原文，不折算、不叠加、不计算到手价；页面原文优惠不等于到手价。</p>
+  </div>
+
+  <div class="card">
+    <h2>巡查进度 <span id="amzJobStatus" class="muted">尚未开始</span></h2>
+    <div class="bar"><i id="amzProgressBar"></i></div>
+    <div id="amzProgressText" class="muted" role="status" aria-live="polite">尚未开始 · 仅在点击“开始巡查”后执行</div>
+    <div id="amzJobDetail" class="amz-note amz-job-detail"></div>
+    <div id="amzLog" class="log" style="margin-top:10px;">等待任务…</div>
+  </div>
+
+  <div class="card">
+    <h2>本次结果 <span id="amzResultsMeta" class="muted">初始基线 / 后续差异 / 无变化 / 错误</span></h2>
+    <div class="amz-table-wrap">
+      <table class="amz-table">
+        <thead><tr><th>ASIN</th><th>结果</th><th>字段差异（旧 → 新）</th><th>说明</th></tr></thead>
+        <tbody id="amzResultsBody"><tr><td colspan="4" class="muted">尚无本次任务结果</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>最新有效价格状态 <span id="amzCurrentMeta" class="muted"></span></h2>
+    <p class="amz-note">最近有效值可能并非本次读到；错误、无法确认或未读取不会清空旧值。下表时间 / 状态代表最近一次检查，不表示所有字段都在该次读到；请结合“最近错误 / 保留说明”确认未读取字段。首次建立基线后才会有后续差异。</p>
+    <p class="amz-note">“未读取”不等于“无 Coupon”。Coupon / 促销的空字符串表示明确解析到无展示，显示为“未展示”；缺失或 null 显示为“未读取”。</p>
+    <div class="amz-table-wrap" tabindex="0" role="region" aria-label="最新有效状态表，可横向滚动">
+      <table class="amz-table amz-current-table">
+        <thead><tr><th>ASIN</th><th>标题 title</th><th>购买价 price · USD</th><th>划线参考价 · USD</th><th>Coupon 原文</th><th>促销原文</th><th>可购买状态</th><th>币种</th><th>最近检查</th><th>最近状态</th><th>最近错误 / 保留说明</th></tr></thead>
+        <tbody id="amzCurrentBody"><tr><td colspan="11" class="muted">尚未加载名单</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>历史差异 <span id="amzHistoryMeta" class="muted">最近 100 条；不含首次基线与无变化记录</span></h2>
+    <div class="flex">
+      <label for="amzHistoryFilter" class="amz-note">按 ASIN 筛选</label>
+      <input id="amzHistoryFilter" type="text" maxlength="10" placeholder="留空查看全部" spellcheck="false" style="width:180px;">
+      <button id="amzHistoryBtn" type="button" class="ghost sm" onclick="amzLoadChanges()">查询 / 刷新</button>
+      <button id="amzHistoryClearBtn" type="button" class="ghost sm" onclick="amzClearHistoryFilter()">清除筛选</button>
+    </div>
+    <div class="amz-table-wrap">
+      <table class="amz-table">
+        <thead><tr><th>检查时间</th><th>ASIN</th><th>字段差异（旧 → 新）</th></tr></thead>
+        <tbody id="amzHistoryBody"><tr><td colspan="3" class="muted">尚未加载历史差异</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</section>
 <div id="toast" class="toast"></div>
 
 <script>
@@ -1050,11 +1155,380 @@ async function pollAds() {
   } catch (e) { clearInterval(adsTimer); adsTimer = null; $('btn-ads-auto').disabled = false; toast('轮询失败: ' + e.message); }
 }
 
-refreshAccounts();
-loadPool();
-loadWatchlist();
-loadSources();
-loadRoutinePlan();
+/* ---------- Amazon US price workspace: start ---------- */
+// 与旧 BSR 功能的 amzTimer / amzJobId 完全隔离；页签切换不取消任何任务。
+const amzPriceState = {
+  items: [], maxAsins: 20, watchLoaded: false, watchLoading: false, watchPromise: null,
+  dirty: false, saving: false, starting: false, jobId: null, timer: null, polling: false,
+  finishedJobId: null, historyRequest: 0
+};
+let amzSellerSpriteInitialized = false;
+const amzFieldLabels = {
+  title: '标题 title', price: '购买价 price（USD）', reference_price: '划线参考价 reference_price（USD）',
+  coupon: 'Coupon 原文', promotions: '促销原文', availability: '可购买状态 availability', currency: '币种 currency'
+};
+
+function amzNode(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (className) node.className = className;
+  return node;
+}
+function amzCell(row, text, className) {
+  const cell = amzNode('td', text, className);
+  row.appendChild(cell);
+  return cell;
+}
+function amzEmptyTable(id, columns, text) {
+  const row = amzNode('tr');
+  const cell = amzCell(row, text, 'muted');
+  cell.colSpan = columns;
+  $(id).replaceChildren(row);
+}
+function amzValue(field, value) {
+  if (value === undefined || value === null) return '未读取';
+  if (value === '') return field === 'coupon' || field === 'promotions' ? '未展示' : '未读取';
+  if (field === 'availability') {
+    const labels = { available: '可购买（available）', unavailable: '不可购买（unavailable）', out_of_stock: '缺货（out_of_stock）' };
+    if (Object.hasOwn(labels, value)) return labels[value];
+  }
+  // 不换算价格或优惠；保留后端给出的美元规范字符串和页面原文。
+  return String(value);
+}
+function amzStatusLabel(status) {
+  const labels = { baseline: '初始基线', changed: '有差异', unchanged: '无变化', error: '错误 / 无法确认', running: '巡查中', done: '已完成' };
+  return Object.hasOwn(labels, status) ? labels[status] : (status ? String(status) : '尚未巡查');
+}
+function amzStatusClass(status) {
+  return status === 'error' ? 'amz-error' : status === 'changed' ? 'amz-warning' : status === 'baseline' || status === 'unchanged' ? 'amz-ok' : 'muted';
+}
+function amzAsinLink(value) {
+  const raw = value === undefined || value === null ? '' : String(value);
+  const asin = raw.trim().toUpperCase();
+  if (!/^[A-Z0-9]{10}$/.test(asin)) return amzNode('span', raw || '未读取');
+  const link = amzNode('a', asin, 'dl');
+  // 不使用接口返回的 url；仅允许固定 Amazon US 域名和验证后的 ASIN。
+  link.href = 'https://www.amazon.com/dp/' + asin;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  return link;
+}
+function amzChangeList(changes, emptyText = '无字段差异') {
+  const entries = changes && typeof changes === 'object' && !Array.isArray(changes) ? Object.entries(changes) : [];
+  if (!entries.length) return amzNode('span', emptyText, 'muted');
+  const list = amzNode('ul', undefined, 'amz-changes');
+  for (const [field, raw] of entries) {
+    const change = raw && typeof raw === 'object' ? raw : {};
+    const line = amzNode('li');
+    line.appendChild(amzNode('b', (Object.hasOwn(amzFieldLabels, field) ? amzFieldLabels[field] : field) + '：'));
+    line.appendChild(amzNode('span', amzValue(field, change.old) + ' → ' + amzValue(field, change.new)));
+    list.appendChild(line);
+  }
+  return list;
+}
+function amzRenderCurrent() {
+  const items = amzPriceState.items;
+  $('amzCurrentMeta').textContent = items.length + ' 个 ASIN · 最近有效值（不保证本次读取）';
+  if (!items.length) return amzEmptyTable('amzCurrentBody', 11, '名单为空；保存 ASIN 后可手动开始巡查。');
+  const body = $('amzCurrentBody');
+  body.replaceChildren();
+  for (const raw of items) {
+    const item = raw && typeof raw === 'object' ? raw : {};
+    const current = item.current && typeof item.current === 'object' ? item.current : {};
+    const row = amzNode('tr');
+    amzCell(row).appendChild(amzAsinLink(item.asin));
+    amzCell(row, amzValue('title', current.title), 'amz-title');
+    for (const field of ['price', 'reference_price', 'coupon', 'promotions', 'availability', 'currency']) {
+      amzCell(row, amzValue(field, current[field]));
+    }
+    amzCell(row, item.last_checked || '尚未检查');
+    amzCell(row, amzStatusLabel(item.last_status), amzStatusClass(item.last_status));
+    amzCell(row, item.last_error || '—', item.last_error ? 'amz-error' : 'muted');
+    body.appendChild(row);
+  }
+}
+function amzRenderResults(results) {
+  const items = Array.isArray(results) ? results : [];
+  $('amzResultsMeta').textContent = '已返回 ' + items.length + ' 个 ASIN 的本次结果';
+  if (!items.length) return amzEmptyTable('amzResultsBody', 4, '本次尚无逐项结果；完成后可查看初始基线或后续差异。');
+  const body = $('amzResultsBody');
+  body.replaceChildren();
+  for (const raw of items) {
+    const item = raw && typeof raw === 'object' ? raw : {};
+    const row = amzNode('tr');
+    amzCell(row).appendChild(amzAsinLink(item.asin));
+    amzCell(row, amzStatusLabel(item.status), amzStatusClass(item.status));
+    const emptyText = item.status === 'baseline' ? '首次有效读取，建立基线' : item.status === 'error' ? '未确认新值，保留已有有效值' : '无明确字段差异';
+    amzCell(row).appendChild(amzChangeList(item.changes, emptyText));
+    amzCell(row, item.message || '—');
+    body.appendChild(row);
+  }
+}
+function amzCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : 0;
+}
+function amzRenderJob(job) {
+  const done = amzCount(job.done), total = amzCount(job.total);
+  const percent = total ? Math.min(100, Math.round(done / total * 100)) : 0;
+  $('amzProgressBar').style.width = percent + '%';
+  $('amzJobStatus').textContent = amzStatusLabel(job.status);
+  $('amzJobStatus').className = job.status === 'error' ? 'amz-error' : 'muted';
+  $('amzProgressText').textContent = '进度 ' + done + '/' + total + ' · 初始基线 ' + amzCount(job.baselines)
+    + ' · 有差异 ' + amzCount(job.changed) + ' · 无变化 ' + amzCount(job.unchanged)
+    + ' · 失败 ' + amzCount(job.failed) + ' · ' + amzStatusLabel(job.status);
+  $('amzJobDetail').textContent = job.detail === undefined || job.detail === null ? '' : String(job.detail);
+  const log = Array.isArray(job.log) ? job.log.map(String).join('\n') : (job.log === undefined || job.log === null ? '' : String(job.log));
+  $('amzLog').textContent = log || '等待任务日志…';
+  $('amzLog').scrollTop = $('amzLog').scrollHeight;
+  amzRenderResults(job.results);
+}
+function amzSetNotice(message, error = false) {
+  $('amzWatchNotice').textContent = message;
+  $('amzWatchNotice').className = 'amz-notice ' + (error ? 'amz-error' : 'muted');
+}
+function amzSetControls() {
+  const state = amzPriceState;
+  const busy = state.saving || state.starting || !!state.jobId;
+  $('amzAsins').disabled = busy || state.watchLoading || !state.watchLoaded;
+  $('amzSaveBtn').disabled = busy || state.watchLoading || !state.watchLoaded;
+  $('amzSaveBtn').textContent = state.saving ? '保存中…' : '保存名单';
+  $('amzRunBtn').disabled = busy || state.watchLoading || !state.watchLoaded || !state.items.length || state.dirty;
+  $('amzRunBtn').textContent = state.starting ? '检查 / 启动中…' : state.jobId ? '巡查进行中…' : '开始巡查';
+  $('amzReloadBtn').disabled = state.watchLoading || state.saving || state.starting;
+}
+function amzParseAsins(raw) {
+  const tokens = String(raw).split(/[\s,，]+/).filter(Boolean).map(value => value.toUpperCase());
+  const invalid = tokens.filter(value => !/^[A-Z0-9]{10}$/.test(value));
+  if (invalid.length) throw new Error('ASIN 格式无效：' + invalid.slice(0, 3).join('、') + '；请只输入 10 位字母或数字。');
+  const items = [...new Set(tokens)];
+  if (items.length > amzPriceState.maxAsins) throw new Error('最多保存 ' + amzPriceState.maxAsins + ' 个不同的 ASIN，当前为 ' + items.length + ' 个。');
+  return items;
+}
+function amzUpdateInputMeta() {
+  try {
+    const asins = amzParseAsins($('amzAsins').value);
+    $('amzInputMeta').textContent = '输入 ' + asins.length + ' / ' + amzPriceState.maxAsins + ' 个不同 ASIN · '
+      + (amzPriceState.dirty ? '有未保存修改，请先保存再巡查。' : '保存不会启动巡查；已有 ASIN 的基线会保留。');
+    $('amzInputMeta').className = 'muted';
+  } catch (error) {
+    $('amzInputMeta').textContent = error.message;
+    $('amzInputMeta').className = 'amz-error';
+  }
+}
+function amzApplyWatch(payload, replaceInput = false) {
+  if (!payload || !Array.isArray(payload.items)) throw new Error('巡查名单响应缺少 items。');
+  const state = amzPriceState;
+  state.items = payload.items;
+  const limit = amzCount(payload.max_asins);
+  if (limit > 0) state.maxAsins = Math.min(20, limit);
+  state.watchLoaded = true;
+  if (replaceInput || !state.dirty) {
+    $('amzAsins').value = state.items.map(item => item && item.asin ? String(item.asin) : '').filter(Boolean).join('\n');
+    state.dirty = false;
+  }
+  $('amzWatchMeta').textContent = '已保存 ' + state.items.length + ' / ' + state.maxAsins + ' 个';
+  amzRenderCurrent();
+  amzUpdateInputMeta();
+  amzSetNotice(state.dirty ? '保留了未保存的输入；请先保存再开始巡查。' : '已加载保存名单；仅点击“开始巡查”才会采集，已有基线不会因保存而重置。');
+  if (typeof payload.running_job_id === 'string' && payload.running_job_id.trim() && payload.running_job_id !== state.finishedJobId) {
+    amzFollowPriceJob(payload.running_job_id);
+  }
+  amzSetControls();
+}
+function amzLoadWatch() {
+  const state = amzPriceState;
+  if (state.watchPromise) return state.watchPromise;
+  state.watchLoading = true;
+  amzSetControls();
+  state.watchPromise = (async () => {
+    try {
+      const payload = await api('/api/amazon/watch');
+      amzApplyWatch(payload);
+      return true;
+    } catch (error) {
+      amzSetNotice('名单 / 状态加载失败：' + error.message + '。请点击“刷新状态 / 接续任务”重试；旧值保持不变。', true);
+      return false;
+    } finally {
+      state.watchLoading = false;
+      state.watchPromise = null;
+      amzSetControls();
+    }
+  })();
+  return state.watchPromise;
+}
+async function amzSaveWatch() {
+  const state = amzPriceState;
+  if (state.saving || state.starting || state.jobId || state.watchLoading || !state.watchLoaded) return;
+  const raw = $('amzAsins').value;
+  try { amzParseAsins(raw); }
+  catch (error) { amzSetNotice(error.message, true); toast(error.message); return; }
+  state.saving = true;
+  amzSetControls();
+  try {
+    const payload = await api('/api/amazon/watch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ asins: raw })
+    });
+    amzApplyWatch(payload, true);
+    if (!state.jobId) amzSetNotice('已保存 ' + state.items.length + ' 个 ASIN，已有基线保留；本次保存没有启动巡查。');
+    toast('Amazon US 名单已保存');
+  } catch (error) {
+    amzSetNotice('保存失败：' + error.message + '。输入与旧值保持不变。', true);
+    toast('保存失败：' + error.message);
+  } finally {
+    state.saving = false;
+    amzSetControls();
+  }
+}
+function amzStopPricePolling() {
+  if (amzPriceState.timer !== null) clearInterval(amzPriceState.timer);
+  amzPriceState.timer = null;
+  amzPriceState.jobId = null;
+}
+function amzFollowPriceJob(value) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error('巡查任务响应缺少 job_id。');
+  const state = amzPriceState;
+  if (state.jobId === value && state.timer !== null) return;
+  amzStopPricePolling();
+  state.jobId = value;
+  $('amzJobStatus').textContent = '巡查中';
+  $('amzJobStatus').className = 'muted';
+  amzSetNotice('正在接续后台巡查；切换页签不会停止任务，运行期间不能重复启动或修改名单。');
+  amzSetControls();
+  state.timer = setInterval(amzPollPriceJob, 1800);
+  amzPollPriceJob();
+}
+async function amzRunPrice() {
+  const state = amzPriceState;
+  if (state.saving || state.starting || state.jobId || state.watchLoading || !state.watchLoaded) return;
+  if (state.dirty) return toast('名单有未保存修改，请先保存。');
+  if (!state.items.length) return toast('请先保存至少一个 ASIN。');
+  state.starting = true;
+  amzSetControls();
+  amzSetNotice('先确认服务端任务状态，避免重复启动…');
+  try {
+    // 轮询中断或另一页面已启动任务时，先通过 running_job_id 接续，不盲目重跑。
+    if (!await amzLoadWatch()) return;
+    if (state.jobId) return;
+    if (!state.items.length) return toast('服务端名单为空，请先保存 ASIN。');
+    const payload = await api('/api/amazon/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    if (!payload || typeof payload.job_id !== 'string' || !payload.job_id.trim()) throw new Error('巡查任务响应缺少 job_id。');
+    state.finishedJobId = null;
+    $('amzProgressBar').style.width = '0%';
+    $('amzProgressText').textContent = '巡查任务已提交，等待进度…';
+    $('amzJobDetail').textContent = '';
+    $('amzLog').textContent = '等待任务日志…';
+    amzRenderResults([]);
+    amzFollowPriceJob(payload.job_id);
+  } catch (error) {
+    amzSetNotice('未能确认巡查启动：' + error.message + '。后台可能已接收任务，请刷新状态确认。', true);
+    toast('巡查启动异常：' + error.message);
+  } finally {
+    state.starting = false;
+    amzSetControls();
+  }
+}
+async function amzPollPriceJob() {
+  const state = amzPriceState;
+  const id = state.jobId;
+  if (!id || state.polling) return;
+  state.polling = true;
+  try {
+    const job = await api('/api/job/' + encodeURIComponent(id));
+    if (state.jobId !== id) return;
+    if (!job || !['running', 'done', 'error'].includes(job.status)) throw new Error('任务返回了无法识别的状态。');
+    amzRenderJob(job);
+    if (job.status !== 'running') {
+      state.finishedJobId = id;
+      amzStopPricePolling();
+      amzSetControls();
+      amzSetNotice(job.status === 'done' ? '本次巡查结束；请结合逐项结果与最近检查状态查看有效值。' : '本次巡查异常；错误或无法确认不会清空已有有效值。', job.status === 'error');
+      amzLoadWatch();
+      amzLoadChanges();
+    }
+  } catch (error) {
+    if (state.jobId !== id) return;
+    amzStopPricePolling();
+    $('amzJobStatus').textContent = '连接中断';
+    $('amzJobStatus').className = 'amz-error';
+    $('amzJobDetail').textContent = '轮询中断：' + error.message + '。后台任务可能仍在运行；点击“刷新状态 / 接续任务”恢复，不会停止任务或清空旧值。';
+    amzSetNotice('轮询中断，请刷新状态接续。再次开始前也会先确认服务端是否仍有任务。', true);
+    amzSetControls();
+  } finally {
+    state.polling = false;
+  }
+}
+async function amzLoadChanges() {
+  const request = ++amzPriceState.historyRequest;
+  const asin = $('amzHistoryFilter').value.trim().toUpperCase();
+  if (asin && !/^[A-Z0-9]{10}$/.test(asin)) {
+    $('amzHistoryMeta').textContent = '筛选格式无效，请输入完整的 10 位 ASIN；保留上次列表。';
+    return;
+  }
+  $('amzHistoryFilter').value = asin;
+  $('amzHistoryMeta').textContent = '正在加载最近 100 条差异…';
+  try {
+    const payload = await api('/api/amazon/changes?limit=100' + (asin ? '&asin=' + encodeURIComponent(asin) : ''));
+    if (request !== amzPriceState.historyRequest) return;
+    if (!payload || !Array.isArray(payload.items)) throw new Error('历史差异响应缺少 items。');
+    const items = payload.items.slice(0, 100);
+    const body = $('amzHistoryBody');
+    body.replaceChildren();
+    for (const raw of items) {
+      const item = raw && typeof raw === 'object' ? raw : {};
+      const row = amzNode('tr');
+      amzCell(row, item.checked_at || '未读取');
+      amzCell(row).appendChild(amzAsinLink(item.asin));
+      amzCell(row).appendChild(amzChangeList(item.changes));
+      body.appendChild(row);
+    }
+    if (!items.length) amzEmptyTable('amzHistoryBody', 3, '暂无历史差异；初始基线和无变化不会产生差异记录。');
+    $('amzHistoryMeta').textContent = (asin || '全部 ASIN') + ' · 最近 100 条内共 ' + items.length + ' 条差异（不含初始基线）';
+  } catch (error) {
+    if (request !== amzPriceState.historyRequest) return;
+    $('amzHistoryMeta').textContent = '加载失败（保留上次列表）：' + error.message;
+  }
+}
+function amzClearHistoryFilter() {
+  $('amzHistoryFilter').value = '';
+  amzLoadChanges();
+}
+async function amzReload() {
+  await Promise.all([amzLoadWatch(), amzLoadChanges()]);
+}
+function amzOnAsinInput() {
+  amzPriceState.dirty = true;
+  amzUpdateInputMeta();
+  amzSetControls();
+  amzSetNotice('名单有未保存修改；本次巡查只使用已保存名单，请先保存。');
+}
+function amzInitSellerSprite() {
+  if (amzSellerSpriteInitialized) return;
+  amzSellerSpriteInitialized = true;
+  refreshAccounts();
+  loadPool();
+  loadWatchlist();
+  loadSources();
+  loadRoutinePlan();
+}
+function amzShowPage() {
+  const amazon = window.location.hash === '#amazon';
+  $('amzPanelSellersprite').hidden = amazon;
+  $('amzPanelAmazon').hidden = !amazon;
+  $('amzTabSellersprite').setAttribute('aria-selected', String(!amazon));
+  $('amzTabAmazon').setAttribute('aria-selected', String(amazon));
+  if (amazon) amzReload();
+  else amzInitSellerSprite();
+}
+$('amzAsins').addEventListener('input', amzOnAsinInput);
+$('amzHistoryFilter').addEventListener('keydown', event => {
+  if (event.key === 'Enter') { event.preventDefault(); amzLoadChanges(); }
+});
+window.addEventListener('hashchange', amzShowPage);
+amzShowPage();
+/* ---------- Amazon US price workspace: end ---------- */
 // ④ 手动 ASIN：输入框有内容即可开始查询（不依赖③提取）
 $('manual-asins').addEventListener('input', () => {
   const has = ($('manual-asins').value || '').trim().length > 0;

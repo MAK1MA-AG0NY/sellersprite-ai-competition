@@ -17,6 +17,7 @@ states/
 .uv-cache/
 .pw-browsers/
 .pw-tmp/
+.pw-temp/
 __pycache__/
 *.py[cod]
 *.egg-info/

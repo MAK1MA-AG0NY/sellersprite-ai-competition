@@ -6,6 +6,15 @@ rem   (kept ASCII-only: cmd parses .bat in the ANSI codepage)
 rem ============================================================
 cd /d %~dp0
 set "PLAYWRIGHT_BROWSERS_PATH=%~dp0.pw-browsers"
+rem Keep Playwright artifacts in this writable project directory.
+set "TEMP=%~dp0.pw-temp"
+set "TMP=%TEMP%"
+if not exist "%TEMP%" mkdir "%TEMP%"
+if not exist "%TEMP%\" (
+    echo ERROR: Cannot create Playwright temp directory: %TEMP%
+    pause
+    exit /b 1
+)
 set "PYTHONIOENCODING=utf-8"
 
 rem open the console page after the server has 3s to start

@@ -60,6 +60,21 @@ CREATE TABLE IF NOT EXISTS ads_groups (
     data     TEXT,
     UNIQUE(asin, ad_id)
 );
+CREATE TABLE IF NOT EXISTS amz_watch (
+    asin         TEXT PRIMARY KEY,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    current_data TEXT NOT NULL DEFAULT '{}',
+    last_checked TEXT,
+    last_status  TEXT,
+    last_error   TEXT
+);
+CREATE TABLE IF NOT EXISTS amz_changes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    asin       TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    changes    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_amz_changes_asin ON amz_changes(asin, id);
 """
 
 
@@ -330,5 +345,91 @@ def purge_foreign_ads():
             "UPPER(json_extract(data,'$.asin')) != UPPER(asin)")
         c.commit()
         return {"groups_deleted": n_g, "keywords_deleted": n_kw}
+    finally:
+        c.close()
+
+
+# ---------- Amazon US 手动巡查：当前有效值 + 仅变化历史 ----------
+
+AMZ_FIELDS = ("title", "price", "reference_price", "currency", "coupon", "promotions", "availability")
+
+
+def amz_watchlist():
+    c = _conn()
+    try:
+        rows = c.execute(
+            "SELECT asin, current_data, last_checked, last_status, last_error "
+            "FROM amz_watch WHERE enabled=1 ORDER BY rowid").fetchall()
+        return [{"asin": a, "url": f"https://www.amazon.com/dp/{a}",
+                 "current": json.loads(data), "last_checked": checked,
+                 "last_status": status, "last_error": error}
+                for a, data, checked, status, error in rows]
+    finally:
+        c.close()
+
+
+def amz_save_watchlist(asins):
+    """替换启用名单，不删除已移除商品的有效基线及差异历史。ASIN 由调用方校验。"""
+    c = _conn()
+    try:
+        with c:
+            c.execute("UPDATE amz_watch SET enabled=0")
+            c.executemany(
+                "INSERT INTO amz_watch(asin) VALUES (?) "
+                "ON CONFLICT(asin) DO UPDATE SET enabled=1", [(a,) for a in asins])
+    finally:
+        c.close()
+    return amz_watchlist()
+
+
+def amz_record(asin, data, checked_at=None, note=""):
+    """一次事务更新有效值与差异。None/缺失字段不覆盖；空串表示确认未展示。"""
+    checked_at = checked_at or datetime.now().astimezone().isoformat(timespec="seconds")
+    patch = {k: data[k] for k in AMZ_FIELDS if k in data and data[k] is not None}
+    if not patch:
+        raise ValueError("本次没有可保存的有效字段")
+    c = _conn()
+    try:
+        with c:
+            row = c.execute("SELECT current_data FROM amz_watch WHERE asin=?", (asin,)).fetchone()
+            if not row:
+                raise ValueError("ASIN 不在巡查名单中")
+            old = json.loads(row[0])
+            changes = {k: {"old": old.get(k), "new": v}
+                       for k, v in patch.items() if old.get(k) != v} if old else {}
+            status = "baseline" if not old else "changed" if changes else "unchanged"
+            if changes:
+                c.execute("INSERT INTO amz_changes(asin, checked_at, changes) VALUES (?,?,?)",
+                          (asin, checked_at, json.dumps(changes, ensure_ascii=False)))
+            if status != "unchanged":
+                c.execute("UPDATE amz_watch SET current_data=? WHERE asin=?",
+                          (json.dumps({**old, **patch}, ensure_ascii=False), asin))
+            c.execute("UPDATE amz_watch SET last_checked=?, last_status=?, last_error=? WHERE asin=?",
+                      (checked_at, status, note[:500], asin))
+        return {"asin": asin, "status": status, "changes": changes, "message": note}
+    finally:
+        c.close()
+
+
+def amz_record_error(asin, error):
+    """只覆盖检查元信息，绝不把访问失败写成价格/优惠变化。"""
+    c = _conn()
+    try:
+        with c:
+            c.execute("UPDATE amz_watch SET last_checked=?, last_status='error', last_error=? WHERE asin=?",
+                      (datetime.now().astimezone().isoformat(timespec="seconds"), str(error)[:500], asin))
+    finally:
+        c.close()
+
+
+def amz_changes(asin=None, limit=100):
+    c = _conn()
+    try:
+        args = [asin] if asin else []
+        where = " WHERE asin=?" if asin else ""
+        rows = c.execute("SELECT id, asin, checked_at, changes FROM amz_changes" + where +
+                         " ORDER BY id DESC LIMIT ?", args + [max(1, min(int(limit), 200))]).fetchall()
+        return [{"id": i, "asin": a, "checked_at": checked, "changes": json.loads(data)}
+                for i, a, checked, data in rows]
     finally:
         c.close()

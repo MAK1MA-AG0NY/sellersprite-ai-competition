@@ -26,6 +26,7 @@ import sellersprite_ai_report as ai   # CL 页面下拉框操作(detect_selects/
 import local_db
 import make_report
 import ads_insights as adv
+import amazon_patrol as amz
 
 BASE = sd.BASE
 HERE = sd.HERE
@@ -71,6 +72,7 @@ S = {
     "tasks": [],
     "asins": [], "ai_rows": [], "current_task": None,
     "jobs": {},
+    "amazon_job_id": None,     # 独立巡查任务，不复用卖家精灵当前 ASIN/账号
 }
 LOGIN_SESSIONS = {}   # role -> {browser, ctx, page}
 
@@ -682,11 +684,12 @@ def _load_watchlist():
             wl.setdefault("categories", json.loads(json.dumps(DEFAULT_CATEGORIES)))
             wl.setdefault("bsr_cache", {})
             wl.setdefault("blocked", [])
+            wl.setdefault("own_phones", [])
             for c in wl["categories"]:   # 旧文件迁移：补 bsr_n
                 c.setdefault("bsr_n", BSR_N_DEFAULT)
             return wl
     wl = json.loads(json.dumps(DEFAULT_CATEGORIES))
-    wl = {"manual": [], "categories": wl, "bsr_cache": {}}
+    wl = {"manual": [], "categories": wl, "bsr_cache": {}, "own_phones": []}
     WATCHLIST_FILE.parent.mkdir(exist_ok=True)
     WATCHLIST_FILE.write_text(json.dumps(wl, ensure_ascii=False, indent=1), encoding="utf-8")
     return wl
@@ -709,11 +712,19 @@ def _own_source(title):
 
 
 def _watchlist_all_items():
-    """全量名单（未应用屏蔽）：自家（按产品线细分）+ 类目榜 + 手动补充。"""
+    """全量名单（未应用屏蔽）：资料在售手机 + 数据库自家产品 + 类目榜 + 手动补充。"""
     wl = _load_watchlist()
     rows = local_db.latest()
     own = [r for r in rows if "fossibot" in str(r.get("brand", "")).lower()]
-    own_set = {str(r.get("asin")).upper() for r in own}
+    curated, curated_seen = [], set()
+    for entry in (wl.get("own_phones") or []):
+        if not isinstance(entry, dict):
+            continue
+        asin = str(entry.get("asin") or "").strip().upper()
+        if re.fullmatch(r"[A-Z0-9]{10}", asin) and asin not in curated_seen:
+            curated_seen.add(asin)
+            curated.append({**entry, "asin": asin})
+    own_set = {str(r.get("asin")).strip().upper() for r in own} | curated_seen
     items, seen = [], set()
 
     def add(asin, source, note=""):
@@ -722,6 +733,12 @@ def _watchlist_all_items():
             seen.add(a)
             items.append({"asin": a, "source": source, "note": note})
 
+    # 先加明确在售清单：优先于数据库自动分类，防止旧“自家·手机”屏蔽将其过滤。
+    for entry in curated:
+        model = str(entry.get("model") or "FOSSIBOT 手机").strip()
+        checked_at = str(entry.get("source_checked_at") or "资料日期未注明").strip()
+        note = f"{model} · Amazon US 在售（资料核验 {checked_at}）"
+        add(entry["asin"], "自家·手机（在售清单）", note)
     for r in own:
         add(r.get("asin"), _own_source(r.get("title")), str(r.get("title") or "")[:40])
     cache = wl.get("bsr_cache") or {}
@@ -746,17 +763,19 @@ def _watchlist_all_items():
             add(m.get("asin"), "手动", m.get("note") or "")
         else:
             add(m, "手动")
-    return items, len(own)
+    own_n = sum(1 for i in items
+                if i["source"] == "自家" or i["source"].startswith("自家·"))
+    return items, own_n
 
 
 def _watchlist_items():
     """应用屏蔽后的名单（屏蔽的来源不参与④查询/例跑）。"""
     wl = _load_watchlist()
     blocked = set(wl.get("blocked") or [])
-    items, own_n = _watchlist_all_items()
-    own_active = len([i for i in items
-                      if i["source"] == "自家" or i["source"].startswith("自家·")])
-    items = [i for i in items if i["source"] not in blocked]
+    all_items, _ = _watchlist_all_items()
+    items = [i for i in all_items if i["source"] not in blocked]
+    own_active = sum(1 for i in items
+                     if i["source"] == "自家" or i["source"].startswith("自家·"))
     return items, own_active
 
 
@@ -1129,6 +1148,7 @@ ROUTINE_DEFAULTS = {
     },
     "kw_tokens": ["solar", "panel", "power station", "generator"],
     "kw_daily": 100,        # ⑦ 每日补齐词数（20词/批，主账号+账号池轮转）
+    "cl_count": "150",      # CL 每次请求的竞品数量档位（额度固定5/次，档位拉满最划算）
     "watchlist_chunk": 150,
     "ads_limit": 5,         # ⑥ 周五收割的竞品数
     "amz_bsr_urls": [],     # Amazon 类目BSR榜单页：[{"category":"便携电站","url":"https://www.amazon.com/gp/bestsellers/...","n":50}]
@@ -1285,13 +1305,22 @@ async def run_routine(job_id: str):
         S["jobs"][sid]["status"] = "done"
     await phase("⑦官方指标补齐", _kw_fill, "b", timeout=1200)
 
-    # CL 找竞品（按星期；5 额度/次）
+    # CL 找竞品（按星期；5 额度/次，竞品数量档位拉满最划算）
     seed = (cfg.get("cl_seeds") or {}).get(wd) or ""
     if seed:
-        await phase(f"CL找竞品（{seed}）",
-                    lambda sid: run_cl_job(sid, [seed], None, None, True), "c", timeout=1500)
-        job["log"].append("[i] CL 产出竞品已自动提取，明天 ④ 例跑会自动覆盖到新 ASIN；"
-                          "也可现在回④手动查询一次立即入库")
+        cl_count = str(cfg.get("cl_count") or "150")
+        await phase(f"CL找竞品（{seed} · {cl_count}竞品位）",
+                    lambda sid: run_cl_job(sid, [seed], None, cl_count, True),
+                    "c", timeout=1800)
+        # CL 产出竞品当天入库快照（找 → 存 闭环）
+        if S["asins"] and not str(S.get("current_task") or "").startswith("routine"):
+            n_ext = len(S["asins"])
+            await phase(f"④′ CL产出竞品快照（{n_ext}个）",
+                        lambda sid: run_lookup(sid, 150), "c2", timeout=1800)
+            job["log"].append("[i] CL 产出竞品已完成当日快照入库；名单类目仍由长期 BSR 榜驱动")
+        else:
+            job["log"].append("[i] CL 未产出新竞品（可能提交失败或配额用尽），跳过快照")
+            phases["④′ CL产出快照"] = {"status": "skipped"}
     else:
         job["log"].append(f"[i] {wd} 未配置 CL 种子，跳过（routine.json → cl_seeds.{wd}）")
         phases["CL找竞品"] = {"status": "skipped"}
@@ -1961,6 +1990,60 @@ async def cleanup(req: dict = None):
             "detail": {"旧报告": rep_rm, "调试转储": dbg_rm, "截图": png_rm,
                        "发散ASIN组清除": purged["groups_deleted"],
                        "发散ASIN关键词行清除": purged["keywords_deleted"]}}
+
+# ---------- Amazon US 手动价格巡查（独立于卖家精灵链路） ----------
+
+def _amazon_running_job():
+    job_id = S.get("amazon_job_id")
+    return job_id if S["jobs"].get(job_id, {}).get("status") == "running" else None
+
+
+def _amazon_watch_payload():
+    return {"items": local_db.amz_watchlist(), "max_asins": amz.MAX_ASINS,
+            "running_job_id": _amazon_running_job()}
+
+
+@app.get("/api/amazon/watch")
+async def amazon_watch():
+    return _amazon_watch_payload()
+
+
+@app.post("/api/amazon/watch")
+async def amazon_save_watch(req: dict):
+    if _amazon_running_job():
+        raise HTTPException(409, "巡查进行中，请结束后再修改名单")
+    try:
+        asins = amz.parse_asins(req.get("asins", ""))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    local_db.amz_save_watchlist(asins)
+    return _amazon_watch_payload()
+
+
+@app.post("/api/amazon/run")
+async def amazon_run(req: dict):  # 要求 JSON 请求，拒绝外站普通表单触发本地浏览器
+    if _amazon_running_job():
+        raise HTTPException(409, "已有 Amazon 巡查进行中")
+    asins = [item["asin"] for item in local_db.amz_watchlist()]
+    if not asins:
+        raise HTTPException(400, "请先保存 Amazon 巡查名单")
+    job_id = f"amzprice{time.time_ns()}"
+    job = {"status": "running", "log": [], "done": 0, "total": len(asins),
+           "rows": 0, "type": "amazon_price", "changed": 0, "baselines": 0,
+           "unchanged": 0, "failed": 0, "results": [], "detail": "打开独立 Amazon 浏览器…"}
+    S["jobs"][job_id] = job
+    S["amazon_job_id"] = job_id
+    asyncio.create_task(amz.run_patrol(asins, job))
+    return {"job_id": job_id}
+
+
+@app.get("/api/amazon/changes")
+async def amazon_changes(asin: str = "", limit: int = 100):
+    asin = asin.strip().upper()
+    if asin and not amz.ASIN_RE.fullmatch(asin):
+        raise HTTPException(400, "ASIN 格式错误")
+    return {"items": local_db.amz_changes(asin or None, limit)}
+
 
 # ---------- 页面 ----------
 
