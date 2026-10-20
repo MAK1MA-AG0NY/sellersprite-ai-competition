@@ -75,11 +75,23 @@ class PriceParserTests(unittest.TestCase):
             patrol.normalize_observation(ASIN, raw_product(), "https://example.com/product")
 
     def test_unavailable_is_explicit_and_does_not_invent_a_price(self):
-        data, _ = patrol.normalize_observation(
+        data, note = patrol.normalize_observation(
             ASIN, raw_product(price_text="", availability_text="Currently unavailable"), patrol.product_url(ASIN))
         self.assertEqual(data["availability"], "unavailable")
         self.assertNotIn("price", data)
         self.assertNotIn("coupon", data)
+        self.assertIn("缺货", note)
+        self.assertNotIn("当前未展示购买价", note)
+
+    def test_reported_b0d17cw6kk_is_out_of_stock_even_with_stale_price_markup(self):
+        asin = "B0D17CW6KK"
+        message = "Currently unavailable.\nWe don't know when or if this item will be back in stock."
+        for price in ("", "$299.00"):
+            data, note = patrol.normalize_observation(
+                asin, raw_product(page_asin=asin, price_text=price, availability_text=message), patrol.product_url(asin))
+            self.assertEqual(data["availability"], "unavailable")
+            self.assertIn("缺货", note)
+            self.assertNotIn("price", data)
 
 
 def isolated_memory_db():
@@ -140,6 +152,21 @@ class MemoryDBTests(unittest.TestCase):
         local_db.amz_save_watchlist([ASIN])
         self.assertEqual(self.current()["price"], "299.00")
         self.assertEqual(local_db.latest()[0]["price"], 500)
+
+    def test_stock_and_restock_are_differences_without_zeroing_history_price(self):
+        initial, _ = patrol.normalize_observation(ASIN, raw_product(), patrol.product_url(ASIN))
+        local_db.amz_record(ASIN, initial)
+        missing, note = patrol.normalize_observation(
+            ASIN, raw_product(price_text="", availability_text="Currently unavailable. We don't know when or if this item will be back in stock."),
+            patrol.product_url(ASIN))
+        result = local_db.amz_record(ASIN, missing, note=note)
+        self.assertEqual(result["changes"], {"availability": {"old": "available", "new": "unavailable"}})
+        self.assertEqual(self.current()["price"], "299.00")
+        self.assertIn("缺货", local_db.amz_watchlist()[0]["last_error"])
+        self.assertEqual(local_db.amz_record(ASIN, missing, note=note)["status"], "unchanged")
+        restored = local_db.amz_record(ASIN, initial)
+        self.assertEqual(restored["changes"], {"availability": {"old": "unavailable", "new": "available"}})
+        self.assertEqual(len(local_db.amz_changes()), 2)
 
     def test_change_and_current_update_roll_back_together(self):
         local_db.amz_record(ASIN, {"price": "299.00"})
@@ -228,6 +255,78 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
             await self.server.amazon_save_watch({"asins": "http://127.0.0.1/"})
         self.assertEqual(error.exception.status_code, 400)
         self.assertEqual((await self.server.amazon_watch())["items"][0]["asin"], ASIN)
+
+    async def test_group_crud_and_deleted_default_keep_existing_baseline(self):
+        from fastapi import HTTPException
+        default_id = (await self.server.amazon_groups())["default_group_id"]
+        created = await self.server.amazon_create_group({"name": " F2400 竞品 "})
+        group_id = created["group"]["id"]
+        await self.server.amazon_save_watch({"group_id": group_id, "asins": ASIN})
+        local_db.amz_record(ASIN, {"price": "299.00"})
+        self.assertEqual((await self.server.amazon_watch(default_id))["items"], [])
+        self.assertEqual((await self.server.amazon_watch(group_id))["group_name"], "F2400 竞品")
+        renamed = await self.server.amazon_rename_group(group_id, {"name": "主力电站竞品"})
+        self.assertEqual(renamed["group"]["id"], group_id)
+        await self.server.amazon_delete_group(default_id)
+        fallback = await self.server.amazon_watch()
+        self.assertEqual(fallback["group_id"], group_id)
+        self.assertEqual(fallback["items"][0]["current"]["price"], "299.00")
+        with self.assertRaises(HTTPException) as error:
+            await self.server.amazon_delete_group(group_id)
+        self.assertEqual(error.exception.status_code, 400)
+        with self.assertRaises(HTTPException) as missing:
+            await self.server.amazon_watch(default_id)
+        self.assertEqual(missing.exception.status_code, 404)
+
+    async def test_run_only_selected_group_and_group_changes_wait_for_completion(self):
+        from fastapi import HTTPException
+        first = (await self.server.amazon_groups())["default_group_id"]
+        second = (await self.server.amazon_create_group({"name": "第二组"}))["group"]["id"]
+        await self.server.amazon_save_watch({"group_id": first, "asins": ASIN})
+        await self.server.amazon_save_watch({"group_id": second, "asins": OTHER})
+        gate = asyncio.Event()
+        observed = []
+
+        async def fake_run(asins, job):
+            observed.extend(asins)
+            await gate.wait()
+            job["status"] = "done"
+
+        with patch.object(self.server.amz, "run_patrol", side_effect=fake_run):
+            started = await self.server.amazon_run({"group_id": second})
+            try:
+                await asyncio.sleep(0)
+                self.assertEqual(observed, [OTHER])
+                self.assertEqual(started["group_id"], second)
+                viewing_first = await self.server.amazon_watch(first)
+                self.assertEqual(viewing_first["items"][0]["asin"], ASIN)
+                self.assertEqual(viewing_first["running_job_id"], started["job_id"])
+                for operation in (lambda: self.server.amazon_create_group({"name": "新组"}),
+                                  lambda: self.server.amazon_rename_group(first, {"name": "改名"}),
+                                  lambda: self.server.amazon_delete_group(first)):
+                    with self.assertRaises(HTTPException) as error:
+                        await operation()
+                    self.assertEqual(error.exception.status_code, 409)
+            finally:
+                gate.set()
+                await asyncio.sleep(0)
+        self.assertEqual(self.server.S["jobs"][started["job_id"]]["group_name"], "第二组")
+
+    async def test_history_is_group_scoped_and_bad_group_ids_are_rejected(self):
+        from fastapi import HTTPException
+        first = (await self.server.amazon_groups())["default_group_id"]
+        second = (await self.server.amazon_create_group({"name": "第二组"}))["group"]["id"]
+        await self.server.amazon_save_watch({"group_id": first, "asins": ASIN})
+        await self.server.amazon_save_watch({"group_id": second, "asins": OTHER})
+        for asin in (ASIN, OTHER):
+            local_db.amz_record(asin, {"price": "299.00"})
+            local_db.amz_record(asin, {"price": "279.00"})
+        self.assertEqual([r["asin"] for r in (await self.server.amazon_changes(group_id=first))["items"]], [ASIN])
+        self.assertEqual(len((await self.server.amazon_changes())["items"]), 2)
+        for group_id in (True, "2", 0, -1):
+            with self.assertRaises(HTTPException) as error:
+                await self.server.amazon_save_watch({"group_id": group_id, "asins": ASIN})
+            self.assertEqual(error.exception.status_code, 400)
 
 
 @unittest.skipUnless(os.environ.get("AMZ_BROWSER_TESTS") == "1", "可选本地 Chromium DOM 测试")
@@ -336,14 +435,18 @@ class BrowserSelectorTests(unittest.IsolatedAsyncioTestCase):
             if path == "/":
                 await route.fulfill(content_type="text/html", body=html)
                 return
-            if path == "/api/amazon/watch":
-                data = {"items": [item], "max_asins": 20, "running_job_id": None}
+            if path == "/api/amazon/groups":
+                data = {"items": [{"id": 1, "name": "默认分组", "count": 1}], "default_group_id": 1,
+                        "running_job_id": None}
+            elif path == "/api/amazon/watch":
+                data = {"items": [item], "group_id": 1, "group_name": "默认分组", "max_asins": 20,
+                        "running_job_id": None}
             elif path == "/api/amazon/changes":
                 data = {"items": [{"id": 1, "asin": ASIN, "checked_at": "2026-01-02", "changes": change}]}
             elif path == "/api/amazon/run":
-                data = {"job_id": "fixture-job"}
+                data = {"job_id": "fixture-job", "group_id": 1, "group_name": "默认分组"}
             elif path == "/api/job/fixture-job":
-                data = {"status": "done", "done": 1, "total": 1, "changed": 1,
+                data = {"group_id": 1, "group_name": "默认分组", "status": "done", "done": 1, "total": 1, "changed": 1,
                         "baselines": 0, "unchanged": 0, "failed": 0, "log": [malicious],
                         "results": [{"asin": ASIN, "status": "changed", "changes": change, "message": malicious}]}
             elif path == "/api/accounts":

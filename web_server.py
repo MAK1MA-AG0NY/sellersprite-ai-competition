@@ -1998,51 +1998,110 @@ def _amazon_running_job():
     return job_id if S["jobs"].get(job_id, {}).get("status") == "running" else None
 
 
-def _amazon_watch_payload():
-    return {"items": local_db.amz_watchlist(), "max_asins": amz.MAX_ASINS,
+def _amazon_group(group_id=None):
+    if group_id is not None and (type(group_id) is not int or group_id <= 0):
+        raise HTTPException(400, "group_id 必须是正整数")
+    try:
+        return local_db.amz_get_group(group_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+def _amazon_require_idle():
+    if _amazon_running_job():
+        raise HTTPException(409, "巡查进行中，请结束后再修改分组或名单")
+
+
+def _amazon_watch_payload(group_id=None):
+    group = _amazon_group(group_id)
+    return {"group_id": group["id"], "group_name": group["name"],
+            "items": local_db.amz_watchlist(group["id"]), "max_asins": amz.MAX_ASINS,
             "running_job_id": _amazon_running_job()}
 
 
+@app.get("/api/amazon/groups")
+async def amazon_groups():
+    groups = local_db.amz_groups()
+    return {"items": groups, "default_group_id": groups[0]["id"],
+            "running_job_id": _amazon_running_job()}
+
+
+@app.post("/api/amazon/groups")
+async def amazon_create_group(req: dict):
+    _amazon_require_idle()
+    try:
+        group = local_db.amz_create_group(req.get("name"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"group": group, "items": local_db.amz_groups()}
+
+
+@app.patch("/api/amazon/groups/{group_id}")
+async def amazon_rename_group(group_id: int, req: dict):
+    _amazon_require_idle()
+    _amazon_group(group_id)
+    try:
+        group = local_db.amz_rename_group(group_id, req.get("name"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"group": group, "items": local_db.amz_groups()}
+
+
+@app.delete("/api/amazon/groups/{group_id}")
+async def amazon_delete_group(group_id: int):
+    _amazon_require_idle()
+    _amazon_group(group_id)
+    try:
+        local_db.amz_delete_group(group_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    groups = local_db.amz_groups()
+    return {"items": groups, "group_id": groups[0]["id"]}
+
+
 @app.get("/api/amazon/watch")
-async def amazon_watch():
-    return _amazon_watch_payload()
+async def amazon_watch(group_id: int | None = None):
+    return _amazon_watch_payload(group_id)
 
 
 @app.post("/api/amazon/watch")
 async def amazon_save_watch(req: dict):
-    if _amazon_running_job():
-        raise HTTPException(409, "巡查进行中，请结束后再修改名单")
+    _amazon_require_idle()
+    group = _amazon_group(req.get("group_id"))
     try:
         asins = amz.parse_asins(req.get("asins", ""))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    local_db.amz_save_watchlist(asins)
-    return _amazon_watch_payload()
+    local_db.amz_save_watchlist(asins, group["id"])
+    return _amazon_watch_payload(group["id"])
 
 
 @app.post("/api/amazon/run")
 async def amazon_run(req: dict):  # 要求 JSON 请求，拒绝外站普通表单触发本地浏览器
     if _amazon_running_job():
         raise HTTPException(409, "已有 Amazon 巡查进行中")
-    asins = [item["asin"] for item in local_db.amz_watchlist()]
+    group = _amazon_group(req.get("group_id"))
+    asins = [item["asin"] for item in local_db.amz_watchlist(group["id"])]
     if not asins:
-        raise HTTPException(400, "请先保存 Amazon 巡查名单")
+        raise HTTPException(400, "请先在当前分组保存 Amazon 巡查名单")
     job_id = f"amzprice{time.time_ns()}"
     job = {"status": "running", "log": [], "done": 0, "total": len(asins),
            "rows": 0, "type": "amazon_price", "changed": 0, "baselines": 0,
-           "unchanged": 0, "failed": 0, "results": [], "detail": "打开独立 Amazon 浏览器…"}
+           "unchanged": 0, "failed": 0, "results": [], "detail": "打开独立 Amazon 浏览器…",
+           "group_id": group["id"], "group_name": group["name"]}
     S["jobs"][job_id] = job
     S["amazon_job_id"] = job_id
     asyncio.create_task(amz.run_patrol(asins, job))
-    return {"job_id": job_id}
+    return {"job_id": job_id, "group_id": group["id"], "group_name": group["name"]}
 
 
 @app.get("/api/amazon/changes")
-async def amazon_changes(asin: str = "", limit: int = 100):
+async def amazon_changes(asin: str = "", limit: int = 100, group_id: int | None = None):
     asin = asin.strip().upper()
     if asin and not amz.ASIN_RE.fullmatch(asin):
         raise HTTPException(400, "ASIN 格式错误")
-    return {"items": local_db.amz_changes(asin or None, limit)}
+    group = _amazon_group(group_id) if group_id is not None else None
+    return {"items": local_db.amz_changes(asin or None, limit, group_id=group["id"] if group else None)}
 
 
 # ---------- 页面 ----------

@@ -354,32 +354,154 @@ def purge_foreign_ads():
 AMZ_FIELDS = ("title", "price", "reference_price", "currency", "coupon", "promotions", "availability")
 
 
-def amz_watchlist():
+def _amz_init_groups(c):
+    """仅 Amazon 分组接口惰性建表；默认组存在后不再从 enabled 重建成员。"""
+    with c:
+        c.execute("CREATE TABLE IF NOT EXISTS amz_groups ("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, created_at TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS amz_group_asins ("
+                  "group_id INTEGER, asin TEXT, PRIMARY KEY(group_id, asin))")
+        # 单条条件 INSERT 串行化首次初始化，避免并发连接各建一个默认组。
+        created = c.execute(
+            "INSERT INTO amz_groups(name, created_at) SELECT ?, ? "
+            "WHERE NOT EXISTS (SELECT 1 FROM amz_groups)",
+            ("默认分组", datetime.now().astimezone().isoformat(timespec="seconds")))
+        if created.rowcount:
+            c.execute("INSERT INTO amz_group_asins(group_id, asin) "
+                      "SELECT ?, asin FROM amz_watch WHERE enabled=1", (created.lastrowid,))
+
+
+def _amz_group(c, group_id=None):
+    args = [] if group_id is None else [group_id]
+    where = "" if group_id is None else " WHERE g.id=?"
+    row = c.execute(
+        "SELECT g.id, g.name, COUNT(m.asin) FROM amz_groups g "
+        "LEFT JOIN amz_group_asins m ON m.group_id=g.id" + where +
+        " GROUP BY g.id ORDER BY g.id LIMIT 1", args).fetchone()
+    if not row:
+        raise ValueError("Amazon 分组不存在")
+    return {"id": row[0], "name": row[1], "count": row[2]}
+
+
+def _amz_group_name(name):
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 60:
+        raise ValueError("分组名称须为 1–60 个字符")
+    return name.strip()
+
+
+def _amz_sync_enabled(c):
+    """enabled 仅兼容旧读取方；分组成员表才是名单的唯一来源。"""
+    c.execute("UPDATE amz_watch SET enabled=EXISTS("
+              "SELECT 1 FROM amz_group_asins m WHERE m.asin=amz_watch.asin)")
+
+
+def amz_groups():
+    """按创建顺序返回分组及各自成员数，不复制 ASIN 的当前值或历史。"""
     c = _conn()
     try:
+        _amz_init_groups(c)
         rows = c.execute(
-            "SELECT asin, current_data, last_checked, last_status, last_error "
-            "FROM amz_watch WHERE enabled=1 ORDER BY rowid").fetchall()
-        return [{"asin": a, "url": f"https://www.amazon.com/dp/{a}",
-                 "current": json.loads(data), "last_checked": checked,
-                 "last_status": status, "last_error": error}
-                for a, data, checked, status, error in rows]
+            "SELECT g.id, g.name, COUNT(m.asin) FROM amz_groups g "
+            "LEFT JOIN amz_group_asins m ON m.group_id=g.id GROUP BY g.id ORDER BY g.id").fetchall()
+        return [{"id": i, "name": name, "count": count} for i, name, count in rows]
     finally:
         c.close()
 
 
-def amz_save_watchlist(asins):
-    """替换启用名单，不删除已移除商品的有效基线及差异历史。ASIN 由调用方校验。"""
+def amz_get_group(group_id=None):
+    """None 取现存首组；不依赖默认组固定为 id=1。"""
     c = _conn()
     try:
-        with c:
-            c.execute("UPDATE amz_watch SET enabled=0")
-            c.executemany(
-                "INSERT INTO amz_watch(asin) VALUES (?) "
-                "ON CONFLICT(asin) DO UPDATE SET enabled=1", [(a,) for a in asins])
+        _amz_init_groups(c)
+        return _amz_group(c, group_id)
     finally:
         c.close()
-    return amz_watchlist()
+
+
+def amz_create_group(name):
+    name = _amz_group_name(name)
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        with c:
+            c.execute("BEGIN IMMEDIATE")
+            created = c.execute("INSERT INTO amz_groups(name, created_at) VALUES (?, ?)",
+                                (name, datetime.now().astimezone().isoformat(timespec="seconds")))
+            return _amz_group(c, created.lastrowid)
+    finally:
+        c.close()
+
+
+def amz_rename_group(group_id, name):
+    name = _amz_group_name(name)
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        with c:
+            c.execute("BEGIN IMMEDIATE")
+            group = _amz_group(c, group_id)
+            c.execute("UPDATE amz_groups SET name=? WHERE id=?", (name, group["id"]))
+            return _amz_group(c, group["id"])
+    finally:
+        c.close()
+
+
+def amz_delete_group(group_id):
+    """只删除分类及成员，至少保留一组，避免下次连接再次触发旧名单迁移。"""
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        with c:
+            # 检查与删除共持写锁，两个并发删除也不能删空分组。
+            c.execute("BEGIN IMMEDIATE")
+            group = _amz_group(c, group_id)
+            if c.execute("SELECT COUNT(*) FROM amz_groups").fetchone()[0] <= 1:
+                raise ValueError("至少保留一个 Amazon 分组")
+            c.execute("DELETE FROM amz_group_asins WHERE group_id=?", (group["id"],))
+            c.execute("DELETE FROM amz_groups WHERE id=?", (group["id"],))
+            _amz_sync_enabled(c)
+    finally:
+        c.close()
+
+
+def _amz_watch_items(c, group_id):
+    rows = c.execute(
+        "SELECT w.asin, w.current_data, w.last_checked, w.last_status, w.last_error "
+        "FROM amz_watch w JOIN amz_group_asins m ON m.asin=w.asin "
+        "WHERE m.group_id=? ORDER BY w.rowid", (group_id,)).fetchall()
+    return [{"asin": a, "url": f"https://www.amazon.com/dp/{a}",
+             "current": json.loads(data), "last_checked": checked,
+             "last_status": status, "last_error": error}
+            for a, data, checked, status, error in rows]
+
+
+def amz_watchlist(group_id=None):
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        return _amz_watch_items(c, _amz_group(c, group_id)["id"])
+    finally:
+        c.close()
+
+
+def amz_save_watchlist(asins, group_id=None):
+    """只替换当前组成员；跨组共用原基线/历史。ASIN 由调用方校验。"""
+    asins = list(dict.fromkeys(asins))
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        with c:
+            c.execute("BEGIN IMMEDIATE")
+            group = _amz_group(c, group_id)
+            c.execute("DELETE FROM amz_group_asins WHERE group_id=?", (group["id"],))
+            c.executemany("INSERT INTO amz_watch(asin) VALUES (?) ON CONFLICT(asin) DO NOTHING",
+                          [(a,) for a in asins])
+            c.executemany("INSERT INTO amz_group_asins(group_id, asin) VALUES (?, ?)",
+                          [(group["id"], a) for a in asins])
+            _amz_sync_enabled(c)
+            return _amz_watch_items(c, group["id"])
+    finally:
+        c.close()
 
 
 def amz_record(asin, data, checked_at=None, note=""):
@@ -422,11 +544,18 @@ def amz_record_error(asin, error):
         c.close()
 
 
-def amz_changes(asin=None, limit=100):
+def amz_changes(asin=None, limit=100, group_id=None):
+    """不传 group_id 保持全局历史语义；传入后按该组当前成员过滤历史。"""
     c = _conn()
     try:
         args = [asin] if asin else []
-        where = " WHERE asin=?" if asin else ""
+        filters = ["asin=?"] if asin else []
+        if group_id is not None:
+            _amz_init_groups(c)
+            group = _amz_group(c, group_id)
+            filters.append("asin IN (SELECT asin FROM amz_group_asins WHERE group_id=?)")
+            args.append(group["id"])
+        where = " WHERE " + " AND ".join(filters) if filters else ""
         rows = c.execute("SELECT id, asin, checked_at, changes FROM amz_changes" + where +
                          " ORDER BY id DESC LIMIT ?", args + [max(1, min(int(limit), 200))]).fetchall()
         return [{"id": i, "asin": a, "checked_at": checked, "changes": json.loads(data)}

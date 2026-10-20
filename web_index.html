@@ -175,6 +175,17 @@
   .amz-changes { margin: 0; padding-left: 18px; min-width: 240px; }
   .amz-changes li { margin-bottom: 4px; white-space: pre-wrap; }
   .amz-job-detail { min-height: 20px; margin-top: 6px; white-space: pre-wrap; }
+  .amz-group-strip { display: flex; align-items: stretch; gap: 8px; margin-bottom: 10px; min-width: 0; }
+  .amz-group-tabs { display: flex; gap: 5px; overflow-x: auto; flex: 1; min-width: 0; padding: 4px 2px 0; border-bottom: 1px solid var(--line); }
+  .amz-group-tab { flex: 0 0 auto; max-width: 250px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-bottom: 0; border-radius: 9px 9px 0 0; background: #f0f2f7; color: var(--text); padding: 10px 13px; }
+  .amz-group-tab:hover { background: #fff4ea; color: var(--orange-dark); }
+  .amz-group-tab[aria-selected=true] { background: #fff4ea; color: var(--orange-dark); border-color: #ffbc87; font-weight: 600; box-shadow: inset 0 3px var(--orange); }
+  .amz-group-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .amz-group-count { font-size: 11px; border-radius: 10px; background: #fff; padding: 1px 6px; white-space: nowrap; }
+  .amz-group-tab:focus-visible { outline: 2px solid var(--orange); outline-offset: -2px; }
+  .amz-group-actions { gap: 8px; margin-bottom: 12px; }
+  .amz-stockout { color: #c62430; font-weight: 700; background: #fff0f1; }
+  .amz-historical { color: var(--orange-dark); }
   @media (max-width: 640px) {
     header { padding: 22px 20px; }
     .amz-tabs { padding-left: 12px; padding-right: 12px; }
@@ -391,7 +402,17 @@
 
   <div class="card">
     <h2>巡查名单 <span id="amzWatchMeta" class="muted">尚未加载</span></h2>
-    <label for="amzAsins" class="amz-note">ASIN（逗号或换行分隔，最多 20 个；自动去重，每个为 10 位字母或数字）</label>
+    <div class="amz-group-strip">
+      <div id="amzGroupTabs" class="amz-group-tabs" role="tablist" aria-label="ASIN 名单分组"></div>
+      <button id="amzGroupAddBtn" type="button" class="ghost sm" onclick="amzCreateGroup()" title="创建命名分组，创建后自动切换" disabled>＋ 新建组</button>
+    </div>
+    <div class="flex amz-group-actions">
+      <button id="amzGroupRenameBtn" type="button" class="ghost sm" onclick="amzRenameGroup()" disabled>重命名当前组</button>
+      <button id="amzGroupDeleteBtn" type="button" class="ghost sm" onclick="amzDeleteGroup()" disabled>删除当前组</button>
+      <span class="amz-note">每组最多 20 个 ASIN；切组不停止任务，运行期间仅可切组查看。</span>
+    </div>
+    <div id="amzGroupWatch" role="tabpanel" aria-label="当前组名单">
+    <label for="amzAsins" class="amz-note">当前组 ASIN（逗号或换行分隔，最多 20 个；自动去重，每个为 10 位字母或数字）</label>
     <textarea id="amzAsins" rows="4" placeholder="例如：B0H4W51ZMH&#10;B0HBPT6N7H" spellcheck="false" style="margin-top:7px;" disabled></textarea>
     <div id="amzInputMeta" class="muted" style="margin-top:6px;">保存名单不会启动巡查；已有 ASIN 的基线会保留。</div>
     <div class="flex amz-controls">
@@ -400,7 +421,8 @@
       <button id="amzReloadBtn" type="button" class="ghost" onclick="amzReload()">刷新状态 / 接续任务</button>
       <button id="amzScheduleBtn" type="button" title="MVP 仅支持人工触发，未启用 Windows 定时任务" disabled>Windows 定时 · 暂未开放</button>
     </div>
-    <div id="amzWatchNotice" class="muted amz-notice" role="status" aria-live="polite">进入本页后加载已保存名单。</div>
+    <div id="amzWatchNotice" class="muted amz-notice" role="status" aria-live="polite">进入本页后先加载分组，再加载当前组名单。</div>
+    </div>
     <p class="amz-note amz-notice">购买价 price 与划线参考价 reference_price 分开记录（美元规范字符串，如 299.00）。Coupon / 促销只保留页面原文，不折算、不叠加、不计算到手价；页面原文优惠不等于到手价。</p>
   </div>
 
@@ -416,8 +438,8 @@
     <h2>本次结果 <span id="amzResultsMeta" class="muted">初始基线 / 后续差异 / 无变化 / 错误</span></h2>
     <div class="amz-table-wrap">
       <table class="amz-table">
-        <thead><tr><th>ASIN</th><th>结果</th><th>字段差异（旧 → 新）</th><th>说明</th></tr></thead>
-        <tbody id="amzResultsBody"><tr><td colspan="4" class="muted">尚无本次任务结果</td></tr></tbody>
+        <thead><tr><th>ASIN</th><th>结果</th><th>本次库存 / 结论</th><th>字段差异（旧 → 新）</th><th>说明</th></tr></thead>
+        <tbody id="amzResultsBody"><tr><td colspan="5" class="muted">尚无本次任务结果</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -425,11 +447,11 @@
   <div class="card">
     <h2>最新有效价格状态 <span id="amzCurrentMeta" class="muted"></span></h2>
     <p class="amz-note">最近有效值可能并非本次读到；错误、无法确认或未读取不会清空旧值。下表时间 / 状态代表最近一次检查，不表示所有字段都在该次读到；请结合“最近错误 / 保留说明”确认未读取字段。首次建立基线后才会有后续差异。</p>
-    <p class="amz-note">“未读取”不等于“无 Coupon”。Coupon / 促销的空字符串表示明确解析到无展示，显示为“未展示”；缺失或 null 显示为“未读取”。</p>
+    <p class="amz-note">“未读取”不等于“无 Coupon”。Coupon / 促销的空字符串表示明确解析到无展示，显示为“未展示”；缺失或 null 显示为“未读取”。缺货商品保留的价格标为“历史价”；本次库存是否确认请看“本次结果”。移除只影响当前组名单，不删除其它组、基线或历史。</p>
     <div class="amz-table-wrap" tabindex="0" role="region" aria-label="最新有效状态表，可横向滚动">
       <table class="amz-table amz-current-table">
-        <thead><tr><th>ASIN</th><th>标题 title</th><th>购买价 price · USD</th><th>划线参考价 · USD</th><th>Coupon 原文</th><th>促销原文</th><th>可购买状态</th><th>币种</th><th>最近检查</th><th>最近状态</th><th>最近错误 / 保留说明</th></tr></thead>
-        <tbody id="amzCurrentBody"><tr><td colspan="11" class="muted">尚未加载名单</td></tr></tbody>
+        <thead><tr><th>ASIN</th><th>标题 title</th><th>购买价 price · USD</th><th>划线参考价 · USD</th><th>Coupon 原文</th><th>促销原文</th><th>最近有效库存状态</th><th>币种</th><th>最近检查</th><th>最近状态</th><th>最近错误 / 保留说明</th><th>当前组操作</th></tr></thead>
+        <tbody id="amzCurrentBody"><tr><td colspan="12" class="muted">尚未加载名单</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1158,9 +1180,11 @@ async function pollAds() {
 /* ---------- Amazon US price workspace: start ---------- */
 // 与旧 BSR 功能的 amzTimer / amzJobId 完全隔离；页签切换不取消任何任务。
 const amzPriceState = {
-  items: [], maxAsins: 20, watchLoaded: false, watchLoading: false, watchPromise: null,
-  dirty: false, saving: false, starting: false, jobId: null, timer: null, polling: false,
-  finishedJobId: null, historyRequest: 0
+  groups: [], groupsLoaded: false, groupsLoading: false, groupsPromise: null,
+  groupId: null, groupBusy: false, reloadPromise: null,
+  items: [], maxAsins: 20, watchLoaded: false, watchLoading: false, watchPromise: null, watchRequest: 0,
+  dirty: false, savedInput: '', saving: false, starting: false, jobId: null, timer: null, polling: false,
+  finishedJobId: null, lastJobId: null, lastJob: null, jobDisconnected: false, historyRequest: 0
 };
 let amzSellerSpriteInitialized = false;
 const amzFieldLabels = {
@@ -1189,7 +1213,7 @@ function amzValue(field, value) {
   if (value === undefined || value === null) return '未读取';
   if (value === '') return field === 'coupon' || field === 'promotions' ? '未展示' : '未读取';
   if (field === 'availability') {
-    const labels = { available: '可购买（available）', unavailable: '不可购买（unavailable）', out_of_stock: '缺货（out_of_stock）' };
+    const labels = { available: '可购买（available）', unavailable: '缺货（unavailable）', out_of_stock: '缺货（out_of_stock）' };
     if (Object.hasOwn(labels, value)) return labels[value];
   }
   // 不换算价格或优惠；保留后端给出的美元规范字符串和页面原文。
@@ -1221,36 +1245,247 @@ function amzChangeList(changes, emptyText = '无字段差异') {
     const change = raw && typeof raw === 'object' ? raw : {};
     const line = amzNode('li');
     line.appendChild(amzNode('b', (Object.hasOwn(amzFieldLabels, field) ? amzFieldLabels[field] : field) + '：'));
-    line.appendChild(amzNode('span', amzValue(field, change.old) + ' → ' + amzValue(field, change.new)));
+    line.appendChild(amzNode('span', amzValue(field, change.old) + ' → ' + amzValue(field, change.new),
+      field === 'availability' && amzIsStockOut(change.new) ? 'amz-stockout' : ''));
     list.appendChild(line);
   }
   return list;
 }
+function amzIsStockOut(value) {
+  return value === 'unavailable' || value === 'out_of_stock';
+}
+function amzSameGroup(a, b) {
+  return a !== undefined && a !== null && b !== undefined && b !== null && String(a) === String(b);
+}
+function amzGroupById(id) {
+  return amzPriceState.groups.find(group => amzSameGroup(group.id, id));
+}
+function amzGroupName(id = amzPriceState.groupId) {
+  const group = amzGroupById(id);
+  return group ? group.name : id === null || id === undefined ? '未选分组' : '分组 ' + String(id);
+}
+function amzMutationBusy() {
+  const state = amzPriceState;
+  return state.groupsLoading || state.groupBusy || state.saving || state.starting || state.watchLoading;
+}
+function amzApplyGroupItems(items) {
+  if (!Array.isArray(items) || !items.length || items.some(group => !group || group.id === undefined || group.id === null)) {
+    throw new Error('分组响应缺少有效的 items；至少需要一个分组。');
+  }
+  amzPriceState.groups = items.map(group => ({ id: group.id, name: String(group.name ?? ''), count: amzCount(group.count) }));
+  amzPriceState.groupsLoaded = true;
+}
+function amzRenderGroups(revealSelected = false) {
+  const state = amzPriceState;
+  const tabs = $('amzGroupTabs');
+  const left = tabs.scrollLeft;
+  let selectedTab = null;
+  tabs.replaceChildren();
+  state.groups.forEach((group, index) => {
+    const selected = amzSameGroup(group.id, state.groupId);
+    const tab = amzNode('button', undefined, 'amz-group-tab');
+    tab.type = 'button';
+    tab.id = 'amzGroupTab' + index;
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', String(selected));
+    tab.setAttribute('aria-controls', 'amzGroupWatch');
+    tab.setAttribute('aria-label', group.name + '，' + group.count + ' 个 ASIN');
+    tab.title = group.name + ' · ' + group.count + ' / 20 个 ASIN';
+    tab.disabled = amzMutationBusy(); // 全局任务运行时仍允许切组查看。
+    tab.appendChild(amzNode('span', group.name, 'amz-group-name'));
+    tab.appendChild(amzNode('span', group.count, 'amz-group-count'));
+    tab.addEventListener('click', () => amzSelectGroup(group.id));
+    tabs.appendChild(tab);
+    if (selected) {
+      selectedTab = tab;
+      $('amzGroupWatch').setAttribute('aria-labelledby', tab.id);
+    }
+  });
+  tabs.scrollLeft = left;
+  if (revealSelected && selectedTab) selectedTab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+function amzRenderWatchMeta() {
+  const state = amzPriceState;
+  $('amzWatchMeta').textContent = '「' + amzGroupName() + '」 · '
+    + (state.watchLoaded ? '已保存 ' + state.items.length + ' / ' + state.maxAsins + ' 个' : '名单尚未加载');
+}
+function amzResetSelectedGroup(id) {
+  const state = amzPriceState;
+  state.groupId = id;
+  ++state.watchRequest;
+  ++state.historyRequest;
+  state.items = [];
+  state.watchLoaded = false;
+  state.dirty = false;
+  state.savedInput = '';
+  $('amzAsins').value = '';
+  $('amzHistoryFilter').value = '';
+  $('amzCurrentMeta').textContent = '「' + amzGroupName() + '」 · 正在加载';
+  $('amzHistoryMeta').textContent = '「' + amzGroupName() + '」 · 正在加载历史差异';
+  amzEmptyTable('amzCurrentBody', 12, '正在加载当前组名单…');
+  amzEmptyTable('amzHistoryBody', 3, '正在加载当前组历史差异…');
+  amzRenderGroups(true);
+  amzRenderWatchMeta();
+  amzRenderSelectedResults();
+  amzUpdateInputMeta();
+  amzSetNotice('正在加载「' + amzGroupName() + '」；切组不会停止全局巡查任务。');
+  amzSetControls();
+}
+async function amzSelectGroup(id) {
+  const state = amzPriceState;
+  if (amzMutationBusy() || amzSameGroup(id, state.groupId)) return false;
+  const group = amzGroupById(id);
+  if (!group) return false;
+  if (state.dirty && !window.confirm('当前组有未保存修改。切换分组将丢弃这些修改，是否继续？')) return false;
+  amzResetSelectedGroup(group.id);
+  const [loaded] = await Promise.all([amzLoadWatch(), amzLoadChanges()]);
+  return loaded;
+}
+function amzSyncRunningJob(value) {
+  const state = amzPriceState;
+  if (typeof value === 'string' && value.trim() && value !== state.finishedJobId) {
+    // watch.group_id 是所选组，不代表 running_job_id 的所属组；必须由 job 响应确认。
+    amzFollowPriceJob(value);
+  } else if (state.jobId && state.timer === null) {
+    amzFollowPriceJob(state.jobId);
+  }
+}
+function amzLoadGroups() {
+  const state = amzPriceState;
+  if (state.groupsPromise) return state.groupsPromise;
+  state.groupsLoading = true;
+  amzSetControls();
+  state.groupsPromise = (async () => {
+    try {
+      const payload = await api('/api/amazon/groups');
+      amzApplyGroupItems(payload && payload.items);
+      amzSyncRunningJob(payload.running_job_id);
+      const target = amzGroupById(state.groupId) || amzGroupById(payload.default_group_id) || state.groups[0];
+      if (!amzSameGroup(target.id, state.groupId)) {
+        if (state.groupId !== null && state.dirty && !window.confirm('原分组已不存在。切到剩余分组将丢弃未保存修改，是否继续？')) {
+          amzRenderGroups();
+          amzSetNotice('原分组已不存在；已保留输入，可先复制，再选择其它分组。', true);
+          return false;
+        }
+        amzResetSelectedGroup(target.id);
+      } else {
+        amzRenderGroups();
+        amzRenderWatchMeta();
+      }
+      return true;
+    } catch (error) {
+      amzSetNotice('分组加载失败：' + error.message + '。请点击“刷新状态 / 接续任务”重试；未启动采集。', true);
+      return false;
+    } finally {
+      state.groupsLoading = false;
+      state.groupsPromise = null;
+      amzSetControls();
+    }
+  })();
+  return state.groupsPromise;
+}
+async function amzChangeGroup(action) {
+  const state = amzPriceState;
+  if (amzMutationBusy() || state.jobId || !state.groupsLoaded) return;
+  const group = amzGroupById(state.groupId);
+  if (action !== 'create' && !group) return;
+  let name;
+  if (action === 'create' || action === 'rename') {
+    const input = window.prompt(action === 'create' ? '新分组名称（1–60 字，可重名）' : '重命名当前分组（1–60 字，可重名）', action === 'rename' ? group.name : '');
+    if (input === null) return;
+    name = input.trim();
+    if (![...name].length || [...name].length > 60) return toast('组名 trim 后须为 1–60 个字。');
+    if (action === 'create' && state.dirty && !window.confirm('创建后会切换到新组，并丢弃当前组未保存修改。是否继续？')) return;
+  } else if (action === 'delete') {
+    if (state.groups.length <= 1) return toast('至少保留一个分组，不能删除最后一组。');
+    if (!window.confirm('删除分组「' + group.name + '」？只删除该分组，不删除 ASIN 基线或历史，不影响其它组。'
+      + (state.dirty ? '\n当前组未保存修改也将丢弃。' : ''))) return;
+  } else return;
+  state.groupBusy = true;
+  amzSetControls();
+  try {
+    const path = '/api/amazon/groups' + (action === 'create' ? '' : '/' + encodeURIComponent(group.id));
+    const options = { method: action === 'create' ? 'POST' : action === 'rename' ? 'PATCH' : 'DELETE' };
+    if (action !== 'delete') {
+      options.headers = { 'Content-Type': 'application/json' };
+      options.body = JSON.stringify({ name });
+    }
+    const payload = await api(path, options);
+    const targetId = action === 'create' ? payload.group && payload.group.id : action === 'delete' ? payload.group_id : group.id;
+    if (targetId === undefined || targetId === null) throw new Error('分组响应缺少目标 group_id。');
+    amzApplyGroupItems(payload.items);
+    const target = amzGroupById(targetId);
+    if (!target) throw new Error('分组响应中找不到目标组。');
+    if (action === 'rename') {
+      amzRenderGroups();
+      amzRenderWatchMeta();
+      amzRenderCurrent();
+      amzRenderSelectedResults();
+      amzSetNotice('当前组已重命名；名单、基线及历史保持不变。' + (state.dirty ? '输入框未保存修改已保留。' : ''));
+      await amzLoadChanges();
+    } else {
+      amzResetSelectedGroup(target.id);
+      await Promise.all([amzLoadWatch(), amzLoadChanges()]);
+    }
+    toast(action === 'create' ? '分组已创建，已切换到新组' : action === 'rename' ? '分组已重命名' : '分组已删除，基线和历史未删除');
+  } catch (error) {
+    amzSetNotice('分组操作失败：' + error.message + '。可刷新状态确认；输入保持不变。', true);
+    toast('分组操作失败：' + error.message);
+  } finally {
+    state.groupBusy = false;
+    amzSetControls();
+  }
+}
+function amzCreateGroup() { return amzChangeGroup('create'); }
+function amzRenameGroup() { return amzChangeGroup('rename'); }
+function amzDeleteGroup() { return amzChangeGroup('delete'); }
 function amzRenderCurrent() {
-  const items = amzPriceState.items;
-  $('amzCurrentMeta').textContent = items.length + ' 个 ASIN · 最近有效值（不保证本次读取）';
-  if (!items.length) return amzEmptyTable('amzCurrentBody', 11, '名单为空；保存 ASIN 后可手动开始巡查。');
+  const state = amzPriceState;
+  const items = state.items;
+  $('amzCurrentMeta').textContent = '「' + amzGroupName() + '」 · ' + items.length + ' 个 ASIN · 最近有效值（不保证本次读取）';
+  if (!items.length) return amzEmptyTable('amzCurrentBody', 12, '当前组名单为空；保存 ASIN 后可手动开始巡查。');
   const body = $('amzCurrentBody');
   body.replaceChildren();
   for (const raw of items) {
     const item = raw && typeof raw === 'object' ? raw : {};
     const current = item.current && typeof item.current === 'object' ? item.current : {};
+    const stockOut = amzIsStockOut(current.availability);
     const row = amzNode('tr');
     amzCell(row).appendChild(amzAsinLink(item.asin));
     amzCell(row, amzValue('title', current.title), 'amz-title');
     for (const field of ['price', 'reference_price', 'coupon', 'promotions', 'availability', 'currency']) {
-      amzCell(row, amzValue(field, current[field]));
+      let text = amzValue(field, current[field]);
+      const historicalPrice = stockOut && (field === 'price' || field === 'reference_price')
+        && current[field] !== undefined && current[field] !== null && current[field] !== '';
+      if (historicalPrice) text += '（历史价）';
+      if (field === 'availability' && stockOut) text += item.last_status === 'error' ? ' · 历史库存状态，本次无法确认' : ' · 最近有效状态，非本次库存结论';
+      else if (field === 'availability' && item.last_status === 'error' && current[field]) text += ' · 历史状态，本次无法确认';
+      amzCell(row, text, field === 'availability' && stockOut ? 'amz-stockout' : historicalPrice ? 'amz-historical' : '');
     }
     amzCell(row, item.last_checked || '尚未检查');
     amzCell(row, amzStatusLabel(item.last_status), amzStatusClass(item.last_status));
-    amzCell(row, item.last_error || '—', item.last_error ? 'amz-error' : 'muted');
+    amzCell(row, item.last_error || (stockOut ? '保留价格仅供历史参考；本次库存结论请见本次结果。' : '—'), item.last_error ? 'amz-error' : 'muted');
+    const remove = amzNode('button', '移出本组', 'ghost sm');
+    remove.type = 'button';
+    remove.setAttribute('data-amz-remove', String(item.asin || ''));
+    remove.title = '仅从「' + amzGroupName() + '」移除，不影响其它组、基线和历史';
+    remove.disabled = amzMutationBusy() || !!state.jobId || !state.watchLoaded;
+    remove.addEventListener('click', () => amzRemoveAsin(item.asin));
+    amzCell(row).appendChild(remove);
     body.appendChild(row);
   }
 }
-function amzRenderResults(results) {
+function amzResultAvailability(item) {
+  // 只看本条 result 的本次库存；错误或未知值绝不借用 current 的旧库存状态。
+  if (item.status === 'error') return { text: '无法确认（本次读取失败）', className: 'amz-error' };
+  if (amzIsStockOut(item.availability)) return { text: '缺货（本次读取）', className: 'amz-stockout' };
+  if (item.availability === 'available') return { text: '可购买（本次读取）', className: 'amz-ok' };
+  return { text: '无法确认（本次库存未读取）', className: 'muted' };
+}
+function amzRenderResults(results, groupName = amzGroupName()) {
   const items = Array.isArray(results) ? results : [];
-  $('amzResultsMeta').textContent = '已返回 ' + items.length + ' 个 ASIN 的本次结果';
-  if (!items.length) return amzEmptyTable('amzResultsBody', 4, '本次尚无逐项结果；完成后可查看初始基线或后续差异。');
+  $('amzResultsMeta').textContent = '「' + groupName + '」 · 已返回 ' + items.length + ' 个 ASIN 的本次结果';
+  if (!items.length) return amzEmptyTable('amzResultsBody', 5, '本次尚无逐项结果；完成后可查看初始基线或后续差异。');
   const body = $('amzResultsBody');
   body.replaceChildren();
   for (const raw of items) {
@@ -1258,11 +1493,34 @@ function amzRenderResults(results) {
     const row = amzNode('tr');
     amzCell(row).appendChild(amzAsinLink(item.asin));
     amzCell(row, amzStatusLabel(item.status), amzStatusClass(item.status));
+    const availability = amzResultAvailability(item);
+    amzCell(row, availability.text, availability.className);
     const emptyText = item.status === 'baseline' ? '首次有效读取，建立基线' : item.status === 'error' ? '未确认新值，保留已有有效值' : '无明确字段差异';
     amzCell(row).appendChild(amzChangeList(item.changes, emptyText));
     amzCell(row, item.message || '—');
     body.appendChild(row);
   }
+}
+function amzJobGroupName(job) {
+  return job.group_name === undefined || job.group_name === null || job.group_name === ''
+    ? job.group_id === undefined || job.group_id === null ? '所属组待确认' : amzGroupName(job.group_id)
+    : String(job.group_name);
+}
+function amzRenderSelectedResults() {
+  const state = amzPriceState;
+  const job = state.lastJob;
+  if (!job) {
+    $('amzResultsMeta').textContent = '「' + amzGroupName() + '」 · 尚无本次任务结果';
+    return amzEmptyTable('amzResultsBody', 5, '当前组尚无本次任务结果；切组不会停止后台任务。');
+  }
+  if (!amzSameGroup(job.group_id, state.groupId)) {
+    const known = job.group_id !== undefined && job.group_id !== null;
+    $('amzResultsMeta').textContent = known ? '任务组「' + amzJobGroupName(job) + '」 · 当前选择「' + amzGroupName() + '」' : '正在确认全局任务所属组';
+    return amzEmptyTable('amzResultsBody', 5, known
+      ? '该任务不属于当前组，不展示为当前组结果。' + (amzGroupById(job.group_id) ? '切回「' + amzJobGroupName(job) + '」可查看本次结果。' : '')
+      : '等待任务响应确认所属组；不会将未知归属的结果显示为当前组结果。');
+  }
+  amzRenderResults(job.results, amzJobGroupName(job));
 }
 function amzCount(value) {
   const number = Number(value);
@@ -1272,16 +1530,16 @@ function amzRenderJob(job) {
   const done = amzCount(job.done), total = amzCount(job.total);
   const percent = total ? Math.min(100, Math.round(done / total * 100)) : 0;
   $('amzProgressBar').style.width = percent + '%';
-  $('amzJobStatus').textContent = amzStatusLabel(job.status);
+  $('amzJobStatus').textContent = '「' + amzJobGroupName(job) + '」 · ' + amzStatusLabel(job.status);
   $('amzJobStatus').className = job.status === 'error' ? 'amz-error' : 'muted';
-  $('amzProgressText').textContent = '进度 ' + done + '/' + total + ' · 初始基线 ' + amzCount(job.baselines)
+  $('amzProgressText').textContent = '任务组「' + amzJobGroupName(job) + '」 · 进度 ' + done + '/' + total + ' · 初始基线 ' + amzCount(job.baselines)
     + ' · 有差异 ' + amzCount(job.changed) + ' · 无变化 ' + amzCount(job.unchanged)
     + ' · 失败 ' + amzCount(job.failed) + ' · ' + amzStatusLabel(job.status);
   $('amzJobDetail').textContent = job.detail === undefined || job.detail === null ? '' : String(job.detail);
   const log = Array.isArray(job.log) ? job.log.map(String).join('\n') : (job.log === undefined || job.log === null ? '' : String(job.log));
   $('amzLog').textContent = log || '等待任务日志…';
   $('amzLog').scrollTop = $('amzLog').scrollHeight;
-  amzRenderResults(job.results);
+  amzRenderSelectedResults();
 }
 function amzSetNotice(message, error = false) {
   $('amzWatchNotice').textContent = message;
@@ -1289,13 +1547,22 @@ function amzSetNotice(message, error = false) {
 }
 function amzSetControls() {
   const state = amzPriceState;
-  const busy = state.saving || state.starting || !!state.jobId;
-  $('amzAsins').disabled = busy || state.watchLoading || !state.watchLoaded;
-  $('amzSaveBtn').disabled = busy || state.watchLoading || !state.watchLoaded;
+  const switching = amzMutationBusy();
+  const busy = switching || !!state.jobId;
+  const selected = !!amzGroupById(state.groupId);
+  $('amzAsins').disabled = busy || !state.watchLoaded || !selected;
+  $('amzSaveBtn').disabled = busy || !state.watchLoaded || !selected;
   $('amzSaveBtn').textContent = state.saving ? '保存中…' : '保存名单';
-  $('amzRunBtn').disabled = busy || state.watchLoading || !state.watchLoaded || !state.items.length || state.dirty;
-  $('amzRunBtn').textContent = state.starting ? '检查 / 启动中…' : state.jobId ? '巡查进行中…' : '开始巡查';
-  $('amzReloadBtn').disabled = state.watchLoading || state.saving || state.starting;
+  $('amzRunBtn').disabled = busy || !state.watchLoaded || !selected || !state.items.length || state.dirty;
+  $('amzRunBtn').textContent = state.starting ? '检查 / 启动中…' : state.jobId ? state.jobDisconnected ? '任务状态待确认…' : '全局巡查进行中…' : '开始巡查';
+  $('amzReloadBtn').disabled = switching;
+  $('amzGroupAddBtn').disabled = busy || !state.groupsLoaded;
+  $('amzGroupRenameBtn').disabled = busy || !selected;
+  $('amzGroupDeleteBtn').disabled = busy || !selected || state.groups.length <= 1;
+  $('amzGroupDeleteBtn').title = state.groups.length <= 1 ? '至少保留一个分组，不能删除最后一组' : '仅删除当前组，不删除 ASIN 基线和历史';
+  for (const tab of $('amzGroupTabs').querySelectorAll('button')) tab.disabled = switching;
+  for (const remove of $('amzCurrentBody').querySelectorAll('button[data-amz-remove]')) remove.disabled = busy || !state.watchLoaded || !selected;
+  for (const id of ['amzHistoryFilter', 'amzHistoryBtn', 'amzHistoryClearBtn']) $(id).disabled = switching || !selected;
 }
 function amzParseAsins(raw) {
   const tokens = String(raw).split(/[\s,，]+/).filter(Boolean).map(value => value.toUpperCase());
@@ -1316,62 +1583,78 @@ function amzUpdateInputMeta() {
     $('amzInputMeta').className = 'amz-error';
   }
 }
-function amzApplyWatch(payload, replaceInput = false) {
+function amzApplyWatch(payload, replaceInput = false, expectedGroupId = amzPriceState.groupId) {
   if (!payload || !Array.isArray(payload.items)) throw new Error('巡查名单响应缺少 items。');
+  if (!amzSameGroup(payload.group_id, expectedGroupId)) throw new Error('名单响应所属组不匹配，已拒绝显示。');
   const state = amzPriceState;
+  if (!amzSameGroup(state.groupId, expectedGroupId)) return false;
   state.items = payload.items;
   const limit = amzCount(payload.max_asins);
   if (limit > 0) state.maxAsins = Math.min(20, limit);
   state.watchLoaded = true;
-  if (replaceInput || !state.dirty) {
-    $('amzAsins').value = state.items.map(item => item && item.asin ? String(item.asin) : '').filter(Boolean).join('\n');
-    state.dirty = false;
+  state.savedInput = state.items.map(item => item && item.asin ? String(item.asin) : '').filter(Boolean).join('\n');
+  if (replaceInput || !state.dirty) $('amzAsins').value = state.savedInput;
+  state.dirty = $('amzAsins').value !== state.savedInput;
+  const group = amzGroupById(state.groupId);
+  if (group) {
+    group.count = state.items.length;
+    if (payload.group_name !== undefined && payload.group_name !== null) group.name = String(payload.group_name);
   }
-  $('amzWatchMeta').textContent = '已保存 ' + state.items.length + ' / ' + state.maxAsins + ' 个';
+  amzRenderGroups();
+  amzRenderWatchMeta();
   amzRenderCurrent();
+  amzRenderSelectedResults();
   amzUpdateInputMeta();
-  amzSetNotice(state.dirty ? '保留了未保存的输入；请先保存再开始巡查。' : '已加载保存名单；仅点击“开始巡查”才会采集，已有基线不会因保存而重置。');
-  if (typeof payload.running_job_id === 'string' && payload.running_job_id.trim() && payload.running_job_id !== state.finishedJobId) {
-    amzFollowPriceJob(payload.running_job_id);
-  }
+  amzSetNotice(state.dirty ? '保留了当前组未保存的输入；请先保存再开始巡查。' : '已加载当前组保存名单；仅点击“开始巡查”才会采集，已有基线不会因保存而重置。');
+  amzSyncRunningJob(payload.running_job_id);
   amzSetControls();
+  return true;
 }
 function amzLoadWatch() {
   const state = amzPriceState;
+  if (state.groupId === null || !state.groupsLoaded) return Promise.resolve(false);
   if (state.watchPromise) return state.watchPromise;
+  const groupId = state.groupId;
+  const request = ++state.watchRequest;
   state.watchLoading = true;
   amzSetControls();
   state.watchPromise = (async () => {
     try {
-      const payload = await api('/api/amazon/watch');
-      amzApplyWatch(payload);
-      return true;
+      const payload = await api('/api/amazon/watch?group_id=' + encodeURIComponent(groupId));
+      if (request !== state.watchRequest || !amzSameGroup(groupId, state.groupId)) return false;
+      return amzApplyWatch(payload, false, groupId);
     } catch (error) {
-      amzSetNotice('名单 / 状态加载失败：' + error.message + '。请点击“刷新状态 / 接续任务”重试；旧值保持不变。', true);
+      if (request === state.watchRequest && amzSameGroup(groupId, state.groupId)) {
+        amzSetNotice('当前组名单 / 状态加载失败：' + error.message + '。请点击“刷新状态 / 接续任务”重试；旧值保持不变。', true);
+      }
       return false;
     } finally {
-      state.watchLoading = false;
-      state.watchPromise = null;
-      amzSetControls();
+      if (request === state.watchRequest) {
+        state.watchLoading = false;
+        state.watchPromise = null;
+        amzSetControls();
+      }
     }
   })();
   return state.watchPromise;
 }
-async function amzSaveWatch() {
+async function amzSaveWatch(rawOverride) {
   const state = amzPriceState;
-  if (state.saving || state.starting || state.jobId || state.watchLoading || !state.watchLoaded) return;
-  const raw = $('amzAsins').value;
+  if (amzMutationBusy() || state.jobId || !state.watchLoaded || !amzGroupById(state.groupId)) return;
+  const raw = rawOverride === undefined ? $('amzAsins').value : String(rawOverride);
+  const groupId = state.groupId;
   try { amzParseAsins(raw); }
   catch (error) { amzSetNotice(error.message, true); toast(error.message); return; }
   state.saving = true;
   amzSetControls();
   try {
     const payload = await api('/api/amazon/watch', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ asins: raw })
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ asins: raw, group_id: groupId })
     });
-    amzApplyWatch(payload, true);
-    if (!state.jobId) amzSetNotice('已保存 ' + state.items.length + ' 个 ASIN，已有基线保留；本次保存没有启动巡查。');
-    toast('Amazon US 名单已保存');
+    if (!amzApplyWatch(payload, true, groupId)) return;
+    if (!state.jobId) amzSetNotice('已保存「' + amzGroupName() + '」的 ' + state.items.length + ' 个 ASIN；不影响其它组、基线和历史，本次没有启动巡查。');
+    toast('Amazon US 当前组名单已保存');
+    amzLoadChanges();
   } catch (error) {
     amzSetNotice('保存失败：' + error.message + '。输入与旧值保持不变。', true);
     toast('保存失败：' + error.message);
@@ -1380,48 +1663,61 @@ async function amzSaveWatch() {
     amzSetControls();
   }
 }
-function amzStopPricePolling() {
+async function amzRemoveAsin(value) {
+  const state = amzPriceState;
+  if (amzMutationBusy() || state.jobId || !state.watchLoaded) return;
+  const asin = String(value || '').trim().toUpperCase();
+  if (!state.items.some(item => item && String(item.asin).toUpperCase() === asin)) return;
+  if (state.dirty && !window.confirm('输入框有未保存修改。移出 ASIN 将丢弃这些修改，并仅从当前组已保存名单移除 ' + asin + '，不影响其它组、基线或历史。是否继续？')) return;
+  const raw = state.items.filter(item => item && String(item.asin).toUpperCase() !== asin).map(item => item.asin).join('\n');
+  return amzSaveWatch(raw);
+}
+function amzStopPricePolling(clearJob = true) {
   if (amzPriceState.timer !== null) clearInterval(amzPriceState.timer);
   amzPriceState.timer = null;
-  amzPriceState.jobId = null;
+  if (clearJob) amzPriceState.jobId = null;
 }
-function amzFollowPriceJob(value) {
+function amzFollowPriceJob(value, context) {
   if (typeof value !== 'string' || !value.trim()) throw new Error('巡查任务响应缺少 job_id。');
   const state = amzPriceState;
-  if (state.jobId === value && state.timer !== null) return;
+  const id = value.trim();
+  if (state.jobId === id && state.timer !== null) return;
   amzStopPricePolling();
-  state.jobId = value;
-  $('amzJobStatus').textContent = '巡查中';
-  $('amzJobStatus').className = 'muted';
-  amzSetNotice('正在接续后台巡查；切换页签不会停止任务，运行期间不能重复启动或修改名单。');
-  amzSetControls();
+  state.jobId = id;
+  state.jobDisconnected = false;
+  if (state.lastJobId !== id) {
+    state.lastJobId = id;
+    state.lastJob = { status: 'running', group_id: context ? context.group_id : null,
+      group_name: context ? context.group_name : null, results: [] };
+  }
+  amzRenderJob(state.lastJob);
+  amzSetNotice('正在接续全局巡查；可切组查看其它名单，不会停止任务。运行期间不能重复启动、修改组或名单。');
   state.timer = setInterval(amzPollPriceJob, 1800);
+  amzSetControls();
   amzPollPriceJob();
 }
 async function amzRunPrice() {
   const state = amzPriceState;
-  if (state.saving || state.starting || state.jobId || state.watchLoading || !state.watchLoaded) return;
-  if (state.dirty) return toast('名单有未保存修改，请先保存。');
-  if (!state.items.length) return toast('请先保存至少一个 ASIN。');
+  if (amzMutationBusy() || state.jobId || !state.watchLoaded || !amzGroupById(state.groupId)) return;
+  if (state.dirty) return toast('当前组名单有未保存修改，请先保存。');
+  if (!state.items.length) return toast('请先在当前组保存至少一个 ASIN。');
+  const groupId = state.groupId;
   state.starting = true;
   amzSetControls();
-  amzSetNotice('先确认服务端任务状态，避免重复启动…');
+  amzSetNotice('先确认服务端全局任务状态，避免重复启动…');
   try {
     // 轮询中断或另一页面已启动任务时，先通过 running_job_id 接续，不盲目重跑。
     if (!await amzLoadWatch()) return;
     if (state.jobId) return;
-    if (!state.items.length) return toast('服务端名单为空，请先保存 ASIN。');
+    if (!amzSameGroup(groupId, state.groupId)) throw new Error('所选组已变化，请重新确认。');
+    if (!state.items.length) return toast('服务端当前组名单为空，请先保存 ASIN。');
     const payload = await api('/api/amazon/run', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ group_id: groupId })
     });
     if (!payload || typeof payload.job_id !== 'string' || !payload.job_id.trim()) throw new Error('巡查任务响应缺少 job_id。');
+    if (!amzSameGroup(payload.group_id, groupId)) throw new Error('任务响应所属组不匹配，请刷新确认任务归属。');
     state.finishedJobId = null;
-    $('amzProgressBar').style.width = '0%';
-    $('amzProgressText').textContent = '巡查任务已提交，等待进度…';
-    $('amzJobDetail').textContent = '';
-    $('amzLog').textContent = '等待任务日志…';
-    amzRenderResults([]);
-    amzFollowPriceJob(payload.job_id);
+    amzFollowPriceJob(payload.job_id, payload);
   } catch (error) {
     amzSetNotice('未能确认巡查启动：' + error.message + '。后台可能已接收任务，请刷新状态确认。', true);
     toast('巡查启动异常：' + error.message);
@@ -1439,19 +1735,24 @@ async function amzPollPriceJob() {
     const job = await api('/api/job/' + encodeURIComponent(id));
     if (state.jobId !== id) return;
     if (!job || !['running', 'done', 'error'].includes(job.status)) throw new Error('任务返回了无法识别的状态。');
+    state.lastJob = job;
+    state.lastJobId = id;
+    state.jobDisconnected = false;
     amzRenderJob(job);
     if (job.status !== 'running') {
       state.finishedJobId = id;
       amzStopPricePolling();
       amzSetControls();
-      amzSetNotice(job.status === 'done' ? '本次巡查结束；请结合逐项结果与最近检查状态查看有效值。' : '本次巡查异常；错误或无法确认不会清空已有有效值。', job.status === 'error');
-      amzLoadWatch();
-      amzLoadChanges();
+      amzSetNotice('「' + amzJobGroupName(job) + '」' + (job.status === 'done' ? '巡查结束；本次结果仅在任务所属组显示。' : '巡查异常；错误或无法确认不会清空已有有效值。'), job.status === 'error');
+      // 即使任务属于其它组，也只刷新当前所选组。待正在加载的名单完成后再取最新值。
+      if (state.watchPromise) state.watchPromise.then(() => amzReload());
+      else amzReload();
     }
   } catch (error) {
     if (state.jobId !== id) return;
-    amzStopPricePolling();
-    $('amzJobStatus').textContent = '连接中断';
+    amzStopPricePolling(false); // 保留全局任务锁；网络中断不代表后台任务结束。
+    state.jobDisconnected = true;
+    $('amzJobStatus').textContent = '连接中断 · 任务状态待确认';
     $('amzJobStatus').className = 'amz-error';
     $('amzJobDetail').textContent = '轮询中断：' + error.message + '。后台任务可能仍在运行；点击“刷新状态 / 接续任务”恢复，不会停止任务或清空旧值。';
     amzSetNotice('轮询中断，请刷新状态接续。再次开始前也会先确认服务端是否仍有任务。', true);
@@ -1461,17 +1762,20 @@ async function amzPollPriceJob() {
   }
 }
 async function amzLoadChanges() {
-  const request = ++amzPriceState.historyRequest;
+  const state = amzPriceState;
+  if (state.groupId === null || !state.groupsLoaded) return;
+  const groupId = state.groupId;
+  const request = ++state.historyRequest;
   const asin = $('amzHistoryFilter').value.trim().toUpperCase();
   if (asin && !/^[A-Z0-9]{10}$/.test(asin)) {
     $('amzHistoryMeta').textContent = '筛选格式无效，请输入完整的 10 位 ASIN；保留上次列表。';
     return;
   }
   $('amzHistoryFilter').value = asin;
-  $('amzHistoryMeta').textContent = '正在加载最近 100 条差异…';
+  $('amzHistoryMeta').textContent = '「' + amzGroupName() + '」 · 正在加载最近 100 条差异…';
   try {
-    const payload = await api('/api/amazon/changes?limit=100' + (asin ? '&asin=' + encodeURIComponent(asin) : ''));
-    if (request !== amzPriceState.historyRequest) return;
+    const payload = await api('/api/amazon/changes?group_id=' + encodeURIComponent(groupId) + '&limit=100' + (asin ? '&asin=' + encodeURIComponent(asin) : ''));
+    if (request !== state.historyRequest || !amzSameGroup(groupId, state.groupId)) return;
     if (!payload || !Array.isArray(payload.items)) throw new Error('历史差异响应缺少 items。');
     const items = payload.items.slice(0, 100);
     const body = $('amzHistoryBody');
@@ -1484,25 +1788,34 @@ async function amzLoadChanges() {
       amzCell(row).appendChild(amzChangeList(item.changes));
       body.appendChild(row);
     }
-    if (!items.length) amzEmptyTable('amzHistoryBody', 3, '暂无历史差异；初始基线和无变化不会产生差异记录。');
-    $('amzHistoryMeta').textContent = (asin || '全部 ASIN') + ' · 最近 100 条内共 ' + items.length + ' 条差异（不含初始基线）';
+    if (!items.length) amzEmptyTable('amzHistoryBody', 3, '当前组暂无历史差异；初始基线和无变化不会产生差异记录。');
+    $('amzHistoryMeta').textContent = '「' + amzGroupName() + '」 · ' + (asin || '组内全部 ASIN') + ' · 最近 100 条内共 ' + items.length + ' 条差异（不含初始基线）';
   } catch (error) {
-    if (request !== amzPriceState.historyRequest) return;
-    $('amzHistoryMeta').textContent = '加载失败（保留上次列表）：' + error.message;
+    if (request !== state.historyRequest || !amzSameGroup(groupId, state.groupId)) return;
+    $('amzHistoryMeta').textContent = '当前组加载失败（保留上次列表）：' + error.message;
   }
 }
 function amzClearHistoryFilter() {
   $('amzHistoryFilter').value = '';
   amzLoadChanges();
 }
-async function amzReload() {
-  await Promise.all([amzLoadWatch(), amzLoadChanges()]);
+function amzReload() {
+  const state = amzPriceState;
+  if (state.reloadPromise) return state.reloadPromise;
+  if (state.saving || state.starting || state.groupBusy || state.watchLoading) return Promise.resolve(false);
+  // 必须先取分组（默认首组），再取选中组的名单与历史；不改变 #amazon 的语义。
+  state.reloadPromise = (async () => {
+    if (!await amzLoadGroups()) return false;
+    const [loaded] = await Promise.all([amzLoadWatch(), amzLoadChanges()]);
+    return loaded;
+  })().finally(() => { state.reloadPromise = null; amzSetControls(); });
+  return state.reloadPromise;
 }
 function amzOnAsinInput() {
-  amzPriceState.dirty = true;
+  amzPriceState.dirty = $('amzAsins').value !== amzPriceState.savedInput;
   amzUpdateInputMeta();
   amzSetControls();
-  amzSetNotice('名单有未保存修改；本次巡查只使用已保存名单，请先保存。');
+  amzSetNotice(amzPriceState.dirty ? '当前组名单有未保存修改；请先保存。切组会询问是否丢弃修改。' : '输入与当前组已保存名单一致。');
 }
 function amzInitSellerSprite() {
   if (amzSellerSpriteInitialized) return;

@@ -183,7 +183,7 @@ def normalize_observation(asin, raw, url):
         raise ObservationError("未识别到明确的一次性美元购买价，也未确认缺货；保留原基线")
     data = {"title": clean_text(raw["title"])}
     notes = []
-    if price:
+    if price and state not in ("unavailable", "out_of_stock"):
         data.update(price=price, currency="USD")
         reference_text = clean_text(raw.get("reference_price_text"))
         reference = usd_price(reference_text)
@@ -203,7 +203,7 @@ def normalize_observation(asin, raw, url):
         if unknown:
             notes.append("/".join(unknown) + "未读取，保留上次有效值（不代表无优惠）")
     else:
-        notes.append("当前未展示购买价，表中金额为上次有效值")
+        notes.append("缺货：页面明确提示暂时无货；保留金额为历史价，不代表当前可购买")
     if state:
         data["availability"] = state
     return data, "；".join(notes)
@@ -288,13 +288,15 @@ async def run_patrol(asins, job):
                     try:
                         data, note = await collect_page(page, asin)
                         result = local_db.amz_record(asin, data, note=note)
+                        result["availability"] = data.get("availability")  # 本次结论，不把历史库存冒充实时状态
                         counter = {"baseline": "baselines", "changed": "changed", "unchanged": "unchanged"}[result["status"]]
                         job[counter] += 1
                         job["log"].append(f"[+] {asin}: {result['status']}" + (f" · {note}" if note else ""))
                     except Exception as exc:
                         message = str(exc)[:500]
                         local_db.amz_record_error(asin, message)
-                        result = {"asin": asin, "status": "error", "changes": {}, "message": message}
+                        result = {"asin": asin, "status": "error", "changes": {}, "message": message,
+                                  "availability": None}
                         job["failed"] += 1
                         job["log"].append(f"[!] {asin}: {message}")
                         blocked = isinstance(exc, AccessBlocked)
