@@ -209,30 +209,152 @@ def normalize_observation(asin, raw, url):
     return data, "；".join(notes)
 
 
+async def _visible_first(page, selectors):
+    """Amazon 弹窗可能在 DOM 中留有隐藏控件；返回首个真正可见的候选。"""
+    for selector in selectors:
+        matches = page.locator(selector)
+        for index in range(await matches.count()):
+            candidate = matches.nth(index)
+            try:
+                if await candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+    return None
+
+
+ZIP_INPUT_SELECTORS = (
+    "#GLUXZipUpdateInput:visible",
+    "#a-popover-content-1 input[type='text']:visible",
+    ".a-popover-wrapper:visible input[type='text']",
+    "input[aria-label*='zip' i]:visible",
+    "input[placeholder*='zip' i]:visible",
+)
+
+
+async def _wait_us_zip_input(page, timeout_ms):
+    try:
+        await page.wait_for_function("""() => {
+          const visible = el => !!el && el.getClientRects().length > 0 &&
+            getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+          return [...document.querySelectorAll('#GLUXZipUpdateInput, #a-popover-content-1 input[type="text"], '
+            + '.a-popover-wrapper input[type="text"], input[aria-label*="zip" i], input[placeholder*="zip" i]')]
+            .some(visible);
+        }""", timeout=timeout_ms)
+    except Exception:
+        return None
+    return await _visible_first(page, ZIP_INPUT_SELECTORS)
+
+
+async def _confirmed_us_zip(page):
+    location = clean_text(await page.locator("#nav-global-location-popover-link").inner_text())
+    return bool(re.search(rf"(?<!\d){re.escape(US_ZIP)}(?!\d)", location))
+
+
 async def prepare_us_delivery(page):
-    """通过官网的公开配送弹窗固定美国邮编；失败即停止，不猜测价格环境。"""
+    """通过官网的公开配送弹窗固定美国邮编；若该匿名上下文已是目标邮编则复用。"""
     response = await page.goto("https://www.amazon.com/", wait_until="domcontentloaded", timeout=45000)
     if response and response.status in (403, 429, 503):
         raise AccessBlocked(f"Amazon HTTP {response.status}，未设置配送地区，本轮停止")
     if response and response.status >= 400:
         raise ObservationError(f"配送地区初始化失败：Amazon HTTP {response.status}")
-    if await page.locator("#captchacharacters").count():
-        raise AccessBlocked("Amazon 出现验证码，本轮停止；不自动绕过")
+    body_text = ""
     try:
+        body_text = await page.locator("body").inner_text(timeout=5000)
+    except Exception:
+        pass
+    title = await page.title()
+    if await page.locator("#captchacharacters").count() or re.search(
+            r"robot check|enter the characters you see below|automated access to amazon", f"{title} {body_text}", re.I):
+        raise AccessBlocked("Amazon 出现验证码或访问限制，本轮停止；不自动绕过")
+    try:
+        # Amazon 可在同一配送弹窗中保留已选邮编，却隐藏 ZIP 输入框；先读位置，已符合时不再打开弹窗。
+        if await _confirmed_us_zip(page):
+            return
         await page.locator("#nav-global-location-popover-link").click(timeout=15000)
-        zipcode = page.locator("#GLUXZipUpdateInput")
-        await zipcode.fill(US_ZIP, timeout=15000)
-        await page.locator("#GLUXZipUpdate").click(timeout=15000)
-        # Apply 后确认按钮异步出现，不能用固定短等待后直接跳过。
-        location = clean_text(await page.locator("#nav-global-location-popover-link").inner_text())
-        if US_ZIP not in location:
-            close = page.locator("#GLUXConfirmClose:visible").first
-            await close.wait_for(state="visible", timeout=12000)
-            await close.click()
+
+        # 先等待 GLUX 邮编框；部分地域版要先点提示条中的“Change Address”才加载地址控件。
+        zipcode = await _wait_us_zip_input(page, timeout_ms=2500)
+        if zipcode is None and not await _confirmed_us_zip(page):
+            change_address = await _visible_first(page, (
+                ".glow-toaster-button-submit input[type='submit']",
+                ".glow-toaster-button-submit button",
+                "button:has-text('Change Address')",
+            ))
+            if change_address is not None:
+                try:
+                    await change_address.click(timeout=5000)
+                except Exception:
+                    # Amazon a-button 的文本层可能被它自己的 submit input 覆盖；仅点击已定位的 Change Address 控件。
+                    await change_address.evaluate("el => el.click()")
+                zipcode = await _wait_us_zip_input(page, timeout_ms=12000)
+        if zipcode is None:
+            if await _confirmed_us_zip(page):
+                return
+            raise ObservationError(
+                "Amazon 配送弹窗未显示可见的美国邮编输入框；若页面提示需要先点“Change Address”，"
+                "请稍后重试。当前页面位置："
+                f"{clean_text(await page.locator('#nav-global-location-popover-link').inner_text()) or '未知'}"
+            )
+
+        await zipcode.fill(US_ZIP, timeout=8000)
+        apply = await _visible_first(page, (
+            "#GLUXZipUpdate:visible",
+            "#a-popover-content-1 button[type='submit']:visible",
+            "#a-popover-content-1 input[type='submit']:visible",
+            ".a-popover-wrapper:visible button:has-text('Apply')",
+            ".a-popover-wrapper:visible input[type='submit']",
+        ))
+        if apply is None:
+            raise ObservationError("已填入邮编，但配送弹窗未显示可见的 Apply 按钮")
+        await apply.click(timeout=10000)
+
+        # Apply 后的确认按钮会异步出现；等待 header 更新或可见确认控件，不能立即误判为缺失。
+        await page.wait_for_function(
+            "zip => [...document.querySelectorAll('#glow-ingress-block, #nav-global-location-popover-link')]"
+            ".some(el => el.innerText.includes(zip)) || "
+            "[...document.querySelectorAll('#GLUXConfirmClose, button[name=glowDoneButton]')]"
+            ".some(el => el.getClientRects().length && getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden')",
+            arg=US_ZIP, timeout=12000)
+        if not await _confirmed_us_zip(page):
+            close = await _visible_first(page, (
+                # Amazon 用 a-button 覆盖文本按钮的 submit input 执行真实确认；优先点实际表单控件。
+                "input#GLUXConfirmClose[type='submit']",
+                "#GLUXConfirmClose:visible",
+                "input[name='glowDoneButton'][type='button']",
+                "#a-popover-content-1 button[name='glowDoneButton']:visible",
+                ".a-popover-wrapper:visible button:has-text('Done')",
+            ))
+            if close is None:
+                raise ObservationError("邮编已提交，但 Amazon 未显示可见的确认按钮或更新位置")
+            try:
+                await close.click(timeout=2500)
+            except Exception:
+                # Amazon 的 a-button 有时异步插入透明 submit input 覆盖“Done”文字按钮；
+                # 只在明确显示目标邮编的官方配送对话框内点击该确认控件。
+                clicked = await page.evaluate("""zip => {
+                  const visible = el => !!el && el.getClientRects().length > 0 &&
+                    getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+                  const body = document.body?.innerText || '';
+                  if (!body.includes(zip) || !/You're now shopping for delivery to|selected location to show all products available for the United States/i.test(body)) return false;
+                  // Amazon 的 popover 包装层会随版本变化；邮编确认对话框已核验目标邮编后，只点精确的 GLUX 提交控件。
+                  const submit = [...document.querySelectorAll('input#GLUXConfirmClose[type="submit"]')].find(visible);
+                  const done = [...document.querySelectorAll('button[name="glowDoneButton"]')].find(visible);
+                  const control = submit || done;
+                  if (!control) return false;
+                  control.click();
+                  return true;
+                }""", US_ZIP)
+                if not clicked and not await _confirmed_us_zip(page):
+                    raise ObservationError("美国邮编已提交，但配送确认按钮被遮挡或无法点击")
         await page.wait_for_function(
             "zip => [...document.querySelectorAll('#glow-ingress-block, #nav-global-location-popover-link')]"
             ".some(el => el.innerText.includes(zip))", arg=US_ZIP, timeout=12000)
+    except AccessBlocked:
+        raise
     except Exception as exc:
+        if isinstance(exc, ObservationError):
+            raise
         raise ObservationError(f"未能确认美国配送邮编 {US_ZIP}，本轮停止，未更新价格：{str(exc)[:200]}") from exc
 
 

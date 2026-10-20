@@ -381,6 +381,79 @@ class BrowserSelectorTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_us_zip_reuses_existing_delivery_and_falls_back_to_visible_regional_input(self):
+        from playwright.async_api import async_playwright
+        from urllib.parse import urlsplit
+        state = {"zipcode": "New York 10001", "clicks": 0, "apply": 0}
+
+        async def fixture(route):
+            if urlsplit(route.request.url).path != "/":
+                await route.fulfill(content_type="text/html", body="<title>fixture</title>")
+                return
+            home = f'''<a id="nav-global-location-popover-link" onclick="window.locationClicks++">Deliver to {state['zipcode']}</a>
+              <script>window.locationClicks=0;window.applies=0</script>'''
+            if state["zipcode"] == "Malaysia":
+                home += '''<div class="a-popover-wrapper" role="dialog" style="display:block">
+                  <input id="GLUXZipUpdateInput" type="text" style="display:none">
+                  <div id="a-popover-content-1">
+                    <input aria-label="US zip code" type="text">
+                    <button type="submit" onclick="window.applies++">Apply</button>
+                    <button name="glowDoneButton" style="display:none"
+                      onclick="document.querySelector('#nav-global-location-popover-link').textContent='Deliver to New York 10001'">Done</button>
+                  </div></div><script>
+                    document.querySelector('#nav-global-location-popover-link').onclick=function(){
+                      window.locationClicks++;document.querySelector('[role=dialog]').style.display='block'};
+                    document.querySelector('#a-popover-content-1 button[type=submit]').onclick=function(){
+                      window.applies++;document.querySelector('[name=glowDoneButton]').style.display='block'};
+                  </script>'''
+            await route.fulfill(content_type="text/html", body=home)
+
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.route("**/*", fixture)
+                # 若匿名上下文已有目标 ZIP，跳过弹窗及其中可能隐藏的 GLUX 输入框。
+                await patrol.prepare_us_delivery(page)
+                self.assertEqual(await page.evaluate("window.locationClicks"), 0)
+                state["zipcode"] = "Malaysia"
+                await patrol.prepare_us_delivery(page)
+                self.assertEqual(await page.evaluate("window.locationClicks"), 1)
+                self.assertEqual(await page.evaluate("window.applies"), 1)
+                self.assertIn("10001", await page.locator("#nav-global-location-popover-link").inner_text())
+            finally:
+                await browser.close()
+
+    async def test_us_zip_clicks_change_address_toaster_before_looking_for_glux_input(self):
+        from playwright.async_api import async_playwright
+        from urllib.parse import urlsplit
+        home = '''<a id="nav-global-location-popover-link">Deliver to Malaysia</a>
+          <div id="toaster" style="display:none"><span class="glow-toaster-button-submit">
+            <input type="submit" value="Change Address"></span></div><div id="address"></div>
+          <script>
+            document.querySelector('#nav-global-location-popover-link').onclick=()=>document.querySelector('#toaster').style.display='block';
+            document.querySelector('.glow-toaster-button-submit input').onclick=()=>{
+              document.querySelector('#address').innerHTML='<div class="a-popover-wrapper"><input id="GLUXZipUpdateInput"><button id="GLUXZipUpdate">Apply</button></div>';
+              document.querySelector('#GLUXZipUpdate').onclick=()=>document.querySelector('#nav-global-location-popover-link').textContent='Deliver to New York '+document.querySelector('#GLUXZipUpdateInput').value;
+            };
+          </script>'''
+
+        async def fixture(route):
+            body = home if urlsplit(route.request.url).path == "/" else "<title>fixture</title>"
+            await route.fulfill(content_type="text/html", body=body)
+
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                await page.route("**/*", fixture)
+                await patrol.prepare_us_delivery(page)
+                self.assertIn("10001", await page.locator("#nav-global-location-popover-link").inner_text())
+                self.assertTrue(await page.locator("#toaster").is_visible())
+                self.assertTrue(await page.locator("#GLUXZipUpdateInput").count())
+            finally:
+                await browser.close()
+
     async def test_fixed_us_zip_and_new_apex_layout_without_real_network(self):
         from playwright.async_api import async_playwright
         from urllib.parse import urlsplit
@@ -389,8 +462,9 @@ class BrowserSelectorTests(unittest.IsolatedAsyncioTestCase):
           <input id="GLUXZipUpdateInput"><button id="GLUXZipUpdate"
           onclick="setTimeout(()=>document.querySelectorAll('#GLUXConfirmClose')[1].style.display='block',80)">Apply</button>
           <button id="GLUXConfirmClose" style="display:none">Hidden duplicate</button>
-          <button id="GLUXConfirmClose" style="display:none"
-          onclick="document.querySelector('#nav-global-location-popover-link').textContent='New York '+document.querySelector('#GLUXZipUpdateInput').value;this.style.display='none'">Done</button>'''
+          <span class="a-button"><input id="GLUXConfirmClose" type="submit"
+          onclick="document.querySelector('#nav-global-location-popover-link').textContent='New York '+document.querySelector('#GLUXZipUpdateInput').value;this.style.display='none'">
+          <button name="glowDoneButton" onclick="return false">Done</button></span>'''
 
         async def fixture(route):
             path = urlsplit(route.request.url).path
