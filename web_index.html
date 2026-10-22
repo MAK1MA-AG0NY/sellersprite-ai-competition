@@ -186,6 +186,17 @@
   .amz-group-actions { gap: 8px; margin-bottom: 12px; }
   .amz-stockout { color: #c62430; font-weight: 700; background: #fff0f1; }
   .amz-historical { color: var(--orange-dark); }
+   .track-table { min-width: 1260px; }
+   .track-table td { vertical-align: top; line-height: 1.6; overflow-wrap: anywhere; }
+   .track-scan { white-space: pre-line; }
+   .track-warning { color: #a74400; font-weight: 700; background: #fff3e0; }
+   .track-delivered { color: var(--green); font-weight: 700; }
+   .track-batch { margin: 10px 0 0; padding-left: 24px; max-height: 260px; overflow-y: auto; }
+   .track-batch li { margin: 5px 0; font-family: Consolas, monospace; overflow-wrap: anywhere; }
+   .track-event-panel { margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #fbfcfe; }
+   .track-event-panel[hidden] { display: none; }
+   .track-event-list { margin: 8px 0 0; padding-left: 22px; }
+   .track-event-list li { margin: 5px 0; overflow-wrap: anywhere; }
   @media (max-width: 640px) {
     header { padding: 22px 20px; }
     .amz-tabs { padding-left: 12px; padding-right: 12px; }
@@ -198,11 +209,12 @@
 <body>
 <header>
   <h1>竞品研究工作台</h1>
-  <p>卖家精灵竞品深挖 · Amazon US 手动价格巡查 · 两个独立工作区</p>
+  <p>卖家精灵竞品深挖 · Amazon US 手动价格巡查 · 17TRACK 手工跟踪辅助</p>
 </header>
 <nav class="amz-tabs" role="tablist" aria-label="工作区">
   <a id="amzTabSellersprite" class="amz-tab" href="#sellersprite" role="tab" aria-controls="amzPanelSellersprite" aria-selected="false">卖家精灵</a>
   <a id="amzTabAmazon" class="amz-tab" href="#amazon" role="tab" aria-controls="amzPanelAmazon" aria-selected="false">Amazon US 价格巡查</a>
+  <a id="amzTabTracking" class="amz-tab" href="#track17" role="tab" aria-controls="amzPanelTracking" aria-selected="false">17TRACK 手工辅助</a>
 </nav>
 <section id="amzPanelSellersprite" class="wrap amz-page" role="tabpanel" aria-labelledby="amzTabSellersprite" hidden>
   <h2 class="amz-heading">卖家精灵 · 竞品深挖控制台</h2>
@@ -469,6 +481,77 @@
         <thead><tr><th>检查时间</th><th>ASIN</th><th>字段差异（旧 → 新）</th></tr></thead>
         <tbody id="amzHistoryBody"><tr><td colspan="3" class="muted">尚未加载历史差异</td></tr></tbody>
       </table>
+    </div>
+  </div>
+</section>
+
+<section id="amzPanelTracking" class="wrap amz-page" role="tabpanel" aria-labelledby="amzTabTracking" hidden>
+  <h2 class="amz-heading">17TRACK · 手工半自动跟踪辅助</h2>
+  <p class="amz-note">本工具只在本地应用保存订单号与运单号，并帮助复制/导入文本；不会自动打开、填写、点击、读取或监听 17TRACK 页面，也不会自动识别验证码或后台轮询。请自行点击下方官方链接，在 17TRACK 手工查询并解决验证码，然后复制摘要粘贴回来。</p>
+
+  <div class="card">
+    <h2>订单与运单号</h2>
+    <label class="amz-note" for="trackingPairs">每行一组：订单号、Tab、运单号（支持从 Excel 直接粘贴两列）</label>
+    <textarea id="trackingPairs" rows="4" spellcheck="false" placeholder="订单号&#9;运单号&#10;ORDER-1001&#9;9400111899223856928493" style="margin-top:7px;"></textarea>
+    <div id="trackingPairsMeta" class="muted" style="margin-top:6px;" aria-live="polite">输入后显示有效行、唯一运单数与格式错误。</div>
+    <div class="flex amz-controls">
+      <button id="trackingAddBtn" type="button" onclick="trackingAddPairs()">保存订单/运单号</button>
+      <button id="trackingRefreshBtn" type="button" class="ghost" onclick="trackingRefresh()">刷新本地状态</button>
+      <span id="trackingNotice" class="muted" role="status" aria-live="polite">数据只通过本地应用 API 读取和保存。</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>待手工查询批次</h2>
+    <p class="amz-note">每批最多 40 个不同运单号；同一运单关联的订单会合并显示。复制后请手工粘贴到官方页面查询，不会自动跳转或操作网站。</p>
+    <div class="flex amz-controls">
+      <button id="trackingBatchRefreshBtn" type="button" class="ghost" onclick="trackingLoadBatch()">刷新下一批</button>
+      <button id="trackingCopyBtn" type="button" onclick="trackingCopyBatch()" disabled>复制运单号</button>
+      <a id="trackingOfficialLink" class="dl" href="https://www.17track.net/zh-cn" target="_blank" rel="noopener noreferrer">手动打开官方 17TRACK 页面</a>
+      <span id="trackingBatchMeta" class="muted">尚未加载批次</span>
+    </div>
+    <ol id="trackingBatchList" class="track-batch"><li class="muted">点击“刷新下一批”加载待查询运单号。</li></ol>
+  </div>
+
+  <div class="card">
+    <h2>导入手工查询摘要</h2>
+    <p class="amz-note">从 17TRACK 手工复制查询摘要后粘贴到这里；提交内容只发送给本地应用，不会重新请求 17TRACK。</p>
+    <textarea id="trackingSummary" rows="5" spellcheck="false" placeholder="在此粘贴从官方页面手工复制的查询摘要"></textarea>
+    <div class="flex amz-controls">
+      <button id="trackingImportBtn" type="button" onclick="trackingImportSummary()">导入摘要</button>
+      <span id="trackingImportResult" class="muted" role="status" aria-live="polite">尚未导入摘要。</span>
+    </div>
+    <div id="trackingImportDetails" class="amz-note" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="card">
+    <h2>FedEx 邮件回复 · 人工复核</h2>
+    <p class="amz-note">可按需只读同步 FETA 收件箱。新结果先进入待复核；只有点击“接受”后才写入本地物流库。IN_TRANSIT / DELIVERED 可映射为系统状态，其他状态只留审计记录，不伪造扫描时间或地点。此处不会发送查询邮件。</p>
+    <div class="flex amz-controls">
+      <button id="trackingFetaSyncBtn" type="button" class="ghost" onclick="trackingFetaSyncInbox()">同步收件箱（只读）</button>
+      <button id="trackingFetaRefreshBtn" type="button" class="ghost" onclick="trackingFetaLoadReviews()">刷新待复核</button>
+      <span id="trackingFetaMeta" class="muted" role="status" aria-live="polite">尚未读取 FETA 待复核队列。</span>
+    </div>
+    <div class="amz-table-wrap" style="margin-top:8px;">
+      <table class="amz-table">
+        <thead><tr><th>事件</th><th>跟踪号</th><th>邮件收件时间</th><th>原始状态 / ETA</th><th>系统状态处理</th><th>解析置信度</th><th>人工决定</th></tr></thead>
+        <tbody id="trackingFetaReviewsBody"><tr><td colspan="7" class="muted">点击“刷新待复核”加载已保存事件；不会自动接受或写回状态。</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>本地订单跟踪状态</h2>
+    <p class="amz-note">扫描时间保留来源原文；无时区信息时明确标注“时区待确认”。仅非 Delivered 包裹在最近扫描已超过 48 小时或服务端标记 stalled 时显示预警。包裹 Delivered 与订单结单状态分开显示。</p>
+    <div class="amz-table-wrap" tabindex="0" role="region" aria-label="订单跟踪状态表，可横向滚动">
+      <table class="amz-table track-table">
+        <thead><tr><th>订单号</th><th>运单号</th><th>状态</th><th>最近扫描时间 / 地点</th><th>扫描间隔 / 风险</th><th>最近导入 / 解析错误</th><th>包裹 / 订单状态</th><th>操作</th></tr></thead>
+        <tbody id="trackingOrdersBody"><tr><td colspan="8" class="muted">点击“刷新本地状态”加载；仅使用本地应用 API。</td></tr></tbody>
+      </table>
+    </div>
+    <div id="trackingEventsPanel" class="track-event-panel" hidden>
+      <div class="flex" style="justify-content:space-between;"><b id="trackingEventsTitle">运单事件</b><button id="trackingEventsClose" type="button" class="ghost sm" onclick="trackingCloseEvents()">收起</button></div>
+      <ol id="trackingEventsList" class="track-event-list"></ol>
     </div>
   </div>
 </section>
@@ -1177,6 +1260,353 @@ async function pollAds() {
   } catch (e) { clearInterval(adsTimer); adsTimer = null; $('btn-ads-auto').disabled = false; toast('轮询失败: ' + e.message); }
 }
 
+/* ---------- Manual 17TRACK helper: local API only, no site automation ---------- */
+const trackingState = { orders: [], maxOrders: 500, batchSize: 40, batch: [], loading: false };
+function trackingNode(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (className) node.className = className;
+  return node;
+}
+function trackingCell(row, text, className) {
+  const cell = trackingNode('td', text, className);
+  row.appendChild(cell);
+  return cell;
+}
+function trackingSetNotice(text, error = false) {
+  const el = $('trackingNotice');
+  el.textContent = text;
+  el.className = error ? 'amz-error' : 'muted';
+}
+function trackingParsePairs(raw) {
+  const pairs = [], invalid = [];
+  String(raw || '').split(/\r?\n/).forEach((line, index) => {
+    if (!line.trim()) return;
+    const cols = line.split('\t').map(value => value.trim());
+    if (cols.length !== 2 || !cols[0] || !cols[1]) invalid.push(index + 1);
+    else pairs.push({ order_id: cols[0], tracking_number: cols[1] });
+  });
+  return { pairs, invalid };
+}
+function trackingUpdatePairsMeta() {
+  const parsed = trackingParsePairs($('trackingPairs').value);
+  const uniqueOrders = new Set(parsed.pairs.map(pair => pair.order_id));
+  const uniqueNumbers = new Set(parsed.pairs.map(pair => pair.tracking_number));
+  const tooMany = parsed.pairs.length > trackingState.maxOrders;
+  let text = `有效 ${parsed.pairs.length} 行 · ${uniqueOrders.size} 个不同订单 · ${uniqueNumbers.size} 个不同运单 / 最多 ${trackingState.maxOrders}`;
+  if (parsed.invalid.length) text += ` · 格式错误行：${parsed.invalid.join(', ')}`;
+  if (tooMany) text += ' · 超出本地保存上限';
+  $('trackingPairsMeta').textContent = text;
+  $('trackingPairsMeta').className = parsed.invalid.length || tooMany ? 'amz-error' : 'muted';
+  $('trackingAddBtn').disabled = !parsed.pairs.length || parsed.invalid.length > 0 || tooMany;
+}
+function trackingFormatTime(item) {
+  const value = item.last_event_at_raw || item.last_event_at || '';
+  if (!value) return item.timezone_unknown ? '扫描时间未知 · 时区待确认' : '尚无扫描时间';
+  return String(value) + (item.timezone_unknown ? ' · 时区待确认' : '');
+}
+function trackingStatusText(item) {
+  const packageText = item.pkg_status_text;
+  if (packageText !== undefined && packageText !== null && String(packageText).trim()) return String(packageText);
+  const fallbackText = item.status_text;
+  if (fallbackText !== undefined && fallbackText !== null && String(fallbackText).trim()) return String(fallbackText);
+  const code = String(item.status || '').trim();
+  const normalized = code.toLowerCase().split(' ').join('_').split('-').join('_');
+  const labels = {
+    pending: '待查询', awaiting_event: '等待首个扫描', not_found: '未匹配',
+    normal: '正常', in_transit: '运输中', transit: '运输中',
+    info_received: '已收到物流信息', pre_transit: '待揽收', label_created: '已创建面单',
+    picked_up: '已揽收', out_for_delivery: '派送中', delivered: '已送达',
+    exception: '运输异常', failed: '运输失败', expired: '物流超时',
+    returned: '已退回', return_to_sender: '退回寄件人'
+  };
+  return Object.hasOwn(labels, normalized) ? labels[normalized] : (code || '待查询');
+}
+function trackingIsDelivered(item) {
+  const text = trackingStatusText(item).toLowerCase();
+  const code = String(item.status || '').toLowerCase();
+  return item.risk === 'delivered' || code === 'delivered' || text.includes('delivered') || text.includes('已送达');
+}
+function trackingRiskLabel(item) {
+  if (trackingIsDelivered(item)) return { text: '已妥投 · 终态', className: 'track-delivered' };
+  const age = item.stale_hours === null || item.stale_hours === undefined || item.stale_hours === ''
+    ? null : Number(item.stale_hours);
+  const ageText = Number.isFinite(age) ? ` · ${Math.floor(age)}h` : '';
+  // The backend risk is authoritative. stale_hours is display-only; awaiting_event age is not a stall.
+  if (item.risk === 'stalled') return { text: '48h+ 无更新预警' + ageText, className: 'track-warning' };
+  if (item.risk === '时区待确认' || item.risk === 'time_unknown' || item.timezone_unknown) {
+    return { text: '时区待确认' + ageText, className: 'track-warning' };
+  }
+  const labels = {
+    normal: '正常', exception: '运输异常', pending: '待查询', not_found: '未匹配',
+    awaiting_event: '等待首个扫描', time_unknown: '时区待确认', stalled: '48h+ 无更新预警'
+  };
+  const label = Object.hasOwn(labels, item.risk) ? labels[item.risk] : (item.risk ? String(item.risk) : '待确认');
+  return { text: label + ageText, className: item.risk === 'exception' ? 'amz-error' : 'muted' };
+}
+function trackingRenderOrders(items) {
+  const body = $('trackingOrdersBody');
+  body.replaceChildren();
+  if (!items.length) {
+    const row = trackingNode('tr'), cell = trackingCell(row, '本地暂无订单；可粘贴订单号和运单号。', 'muted');
+    cell.colSpan = 8; body.appendChild(row); return;
+  }
+  for (const raw of items) {
+    const item = raw && typeof raw === 'object' ? raw : {};
+    const row = trackingNode('tr');
+    trackingCell(row, item.order_id || '—');
+    trackingCell(row, item.tracking_number || '—');
+    const packageStatus = trackingStatusText(item);
+    trackingCell(row, packageStatus);
+    const scan = trackingCell(row, trackingFormatTime(item) + (item.last_event_text ? '\n' + String(item.last_event_text) : '')
+      + (item.last_location ? '\n地点：' + String(item.last_location) : ''));
+    scan.className = 'track-scan';
+    const risk = trackingRiskLabel(item);
+    trackingCell(row, risk.text, risk.className);
+    const importedAt = item.last_import_at || item.last_checked_at || item.created_at || '未记录';
+    trackingCell(row, '最近导入/检查：' + importedAt + (item.last_error ? '\n' + String(item.last_error) : '\n无解析错误'), item.last_error ? 'amz-error' : 'muted');
+    const closed = item.order_closed === true ? '订单：已结单' : item.order_closed === false ? '订单：未结单' : '订单：状态待确认';
+    trackingCell(row, '包裹：' + (trackingIsDelivered(item) ? 'Delivered / 已妥投' : packageStatus) + ' · ' + closed,
+      trackingIsDelivered(item) ? 'track-delivered' : '');
+    const actions = trackingCell(row, '');
+    const id = item.id !== undefined && item.id !== null ? item.id : item.order_id;
+    const toggle = trackingNode('button', item.enabled === false ? '恢复' : '暂停', 'ghost sm');
+    toggle.type = 'button'; toggle.addEventListener('click', () => trackingToggleOrder(id, item.enabled !== false));
+    actions.appendChild(toggle);
+    const remove = trackingNode('button', '移除', 'ghost sm');
+    remove.type = 'button'; remove.style.marginLeft = '5px';
+    remove.addEventListener('click', () => trackingRemoveOrder(id));
+    actions.appendChild(remove);
+    const events = trackingNode('button', '事件', 'ghost sm');
+    events.type = 'button'; events.style.marginLeft = '5px';
+    events.addEventListener('click', () => trackingLoadEvents(item));
+    actions.appendChild(events);
+    body.appendChild(row);
+  }
+}
+async function trackingLoadOrders() {
+  try {
+    const result = await api('/api/tracking/orders');
+    trackingState.orders = Array.isArray(result.items) ? result.items : [];
+    trackingState.maxOrders = Math.max(1, Number(result.max_orders) || 500);
+    trackingState.batchSize = Math.min(40, Math.max(1, Number(result.batch_size) || 40));
+    trackingRenderOrders(trackingState.orders);
+    trackingUpdatePairsMeta();
+    return true;
+  } catch (error) {
+    trackingSetNotice('本地订单读取失败：' + error.message, true);
+    return false;
+  }
+}
+async function trackingAddPairs() {
+  const parsed = trackingParsePairs($('trackingPairs').value);
+  if (!parsed.pairs.length || parsed.invalid.length || parsed.pairs.length === 0) return trackingUpdatePairsMeta();
+  if (parsed.pairs.length > trackingState.maxOrders) return trackingUpdatePairsMeta();
+  const button = $('trackingAddBtn'); button.disabled = true;
+  try {
+    const result = await api('/api/tracking/orders', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pairs: parsed.pairs }) });
+    $('trackingPairs').value = '';
+    trackingUpdatePairsMeta();
+    trackingSetNotice(`已保存：新增 ${Number(result.added) || 0}，重复 ${Number(result.duplicates) || 0}。`);
+    await Promise.all([trackingLoadOrders(), trackingLoadBatch()]);
+  } catch (error) {
+    trackingSetNotice('保存失败：' + error.message, true);
+  } finally { trackingUpdatePairsMeta(); }
+}
+function trackingRenderBatch(items) {
+  const list = $('trackingBatchList'); list.replaceChildren();
+  trackingState.batch = [];
+  const byNumber = new Map();
+  for (const raw of Array.isArray(items) ? items : []) {
+    if (!raw || !raw.tracking_number) continue;
+    const number = String(raw.tracking_number);
+    if (!byNumber.has(number)) byNumber.set(number, new Set());
+    for (const id of (Array.isArray(raw.order_ids) ? raw.order_ids : [])) byNumber.get(number).add(String(id));
+  }
+  for (const [tracking_number, ids] of [...byNumber.entries()].slice(0, trackingState.batchSize)) {
+    const entry = { tracking_number, order_ids: [...ids] };
+    trackingState.batch.push(entry);
+    const li = trackingNode('li');
+    li.appendChild(trackingNode('span', tracking_number));
+    if (entry.order_ids.length) li.appendChild(trackingNode('span', ' · 订单：' + entry.order_ids.join('、'), 'muted'));
+    list.appendChild(li);
+  }
+  if (!trackingState.batch.length) list.appendChild(trackingNode('li', '暂无待查询运单。', 'muted'));
+  $('trackingBatchMeta').textContent = `本批 ${trackingState.batch.length} 个唯一运单（最多 40）`;
+  $('trackingCopyBtn').disabled = !trackingState.batch.length;
+}
+async function trackingLoadBatch() {
+  try {
+    const result = await api('/api/tracking/next-batch?limit=40');
+    trackingRenderBatch(result.items);
+  } catch (error) {
+    $('trackingBatchMeta').textContent = '批次加载失败：' + error.message;
+    $('trackingBatchMeta').className = 'amz-error';
+  }
+}
+async function trackingCopyBatch() {
+  const numbers = [...new Set(trackingState.batch.map(item => item.tracking_number))].slice(0, 40);
+  if (!numbers.length) return;
+  try {
+    await navigator.clipboard.writeText(numbers.join('\n'));
+    $('trackingBatchMeta').textContent = `已复制 ${numbers.length} 个唯一运单号；请手工粘贴到官方页面。`;
+  } catch (error) { trackingSetNotice('无法访问剪贴板，请手动选择列表复制。', true); }
+}
+function trackingDisplayList(values) {
+  return Array.isArray(values) ? values.map(value => typeof value === 'string' ? value : JSON.stringify(value)) : [];
+}
+async function trackingImportSummary() {
+  const text = $('trackingSummary').value;
+  if (!text.trim()) { $('trackingImportResult').textContent = '请先粘贴手工复制的查询摘要。'; return; }
+  const button = $('trackingImportBtn'); button.disabled = true;
+  try {
+    const result = await api('/api/tracking/import-summary', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }) });
+    const unmatchedRaw = Array.isArray(result.unmatched) ? result.unmatched : [];
+    const unmatchedCount = typeof result.unmatched === 'number' && Number.isFinite(result.unmatched)
+      ? result.unmatched : unmatchedRaw.length;
+    const unmatched = (Array.isArray(result.items) ? result.items : [])
+      .filter(item => item && item.matched === false)
+      .map(item => [item.tracking_number, item.order_id].filter(value => value !== undefined && value !== null && String(value) !== '').map(String).join(' · '))
+      .filter(Boolean);
+    if (!unmatched.length && unmatchedRaw.length) unmatched.push(...trackingDisplayList(unmatchedRaw));
+    if (unmatchedCount > 0 && !unmatched.length) unmatched.push('未匹配明细未返回');
+    const errors = trackingDisplayList(result.errors);
+    $('trackingImportResult').textContent = `已匹配 ${Number(result.matched) || 0} · 未匹配 ${unmatchedCount} · 解析错误 ${errors.length}`;
+    const details = $('trackingImportDetails'); details.replaceChildren();
+    if (unmatched.length) details.appendChild(trackingNode('div', '未匹配：' + unmatched.join('；')));
+    if (errors.length) details.appendChild(trackingNode('div', '解析错误：' + errors.join('；'), 'amz-error'));
+    if (Number(result.matched) > 0 && unmatchedCount === 0 && errors.length === 0) $('trackingSummary').value = '';
+    await Promise.all([trackingLoadOrders(), trackingLoadBatch()]);
+    trackingSetNotice('手工摘要已交给本地应用处理；没有访问 17TRACK 页面。');
+  } catch (error) {
+    $('trackingImportResult').textContent = '导入失败：' + error.message;
+    $('trackingImportDetails').replaceChildren();
+  } finally { button.disabled = false; }
+}
+async function trackingToggleOrder(id, enabled) {
+  try {
+    await api('/api/tracking/orders/' + encodeURIComponent(String(id)) + '/enabled', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !enabled }) });
+    await trackingLoadOrders();
+  } catch (error) { trackingSetNotice('更新暂停状态失败：' + error.message, true); }
+}
+async function trackingRemoveOrder(id) {
+  try {
+    await api('/api/tracking/orders/' + encodeURIComponent(String(id)), { method: 'DELETE' });
+    await trackingLoadOrders();
+    await trackingLoadBatch();
+  } catch (error) { trackingSetNotice('移除失败：' + error.message, true); }
+}
+async function trackingLoadEvents(item) {
+  const id = item.id !== undefined && item.id !== null ? item.id : item.order_id;
+  try {
+    const result = await api('/api/tracking/orders/' + encodeURIComponent(String(id)) + '/events');
+    $('trackingEventsTitle').textContent = '订单 ' + String(item.order_id || '') + ' · 运单 ' + String(item.tracking_number || '');
+    const list = $('trackingEventsList'); list.replaceChildren();
+    for (const event of (Array.isArray(result.items) ? result.items : [])) {
+      const eventText = [event.event_text, event.raw_event]
+        .filter(value => value !== undefined && value !== null && String(value) !== '').map(String);
+      const eventStatus = event.pkg_status_text || event.status
+        ? trackingStatusText({ pkg_status_text: event.pkg_status_text, status_text: event.pkg_status_text, status: event.status }) : '';
+      const timeText = event.source === 'feta'
+        ? (event.source_received_at ? 'FedEx 邮件收到：' + event.source_received_at : 'FedEx 邮件结果')
+        : (event.event_at_raw || event.event_at || event.imported_at || '');
+      const details = [timeText, event.source === 'feta' ? '来源：FETA 邮件' : '', eventStatus,
+        event.location || '', ...eventText,
+        event.raw_eta_text ? 'ETA 原文：' + String(event.raw_eta_text) : ''];
+      const detail = details.filter(value => value !== undefined && value !== null && String(value) !== '').map(String).join(' · ');
+      list.appendChild(trackingNode('li', detail || '无事件详情'));
+    }
+    if (!list.childElementCount) list.appendChild(trackingNode('li', '暂无扫描事件。', 'muted'));
+    $('trackingEventsPanel').hidden = false;
+  } catch (error) { trackingSetNotice('读取扫描事件失败：' + error.message, true); }
+}
+function trackingRenderFetaReviews(items) {
+  const body = $('trackingFetaReviewsBody'); body.replaceChildren();
+  for (const event of items) {
+    const row = trackingNode('tr');
+    trackingCell(row, '#' + String(event.id || ''));
+    trackingCell(row, event.tracking_number || '');
+    trackingCell(row, event.received_at_utc || '');
+    const statusEta = [event.raw_status || '', event.raw_eta_text ? 'ETA 原文：' + String(event.raw_eta_text) : '']
+      .filter(Boolean).join('\n');
+    const statusCell = trackingCell(row, statusEta || '—'); statusCell.className = 'track-scan';
+    const targetLabels = { in_transit: '接受后更新为：运输中', delivered: '接受后更新为：已送达' };
+    trackingCell(row, event.system_status ? targetLabels[event.system_status] || String(event.system_status)
+      : '仅记事件，不更改当前状态');
+    const confidence = String(event.parse_confidence || '—');
+    const confidenceCell = trackingCell(row, confidence);
+    confidenceCell.title = event.parser_version ? '解析器：' + String(event.parser_version) : '';
+    const actions = trackingCell(row, '');
+    const accept = trackingNode('button', '接受', 'ghost sm'); accept.type = 'button';
+    accept.addEventListener('click', () => trackingReviewFetaEvent(event, 'accept'));
+    const ignore = trackingNode('button', '忽略', 'ghost sm'); ignore.type = 'button'; ignore.style.marginLeft = '5px';
+    ignore.addEventListener('click', () => trackingReviewFetaEvent(event, 'ignore'));
+    actions.append(accept, ignore); body.appendChild(row);
+  }
+  if (!items.length) {
+    const row = trackingNode('tr'), cell = trackingCell(row, '当前没有待复核事件；需要时可点击“同步收件箱（只读）”。', 'muted');
+    cell.colSpan = 7; body.appendChild(row);
+  }
+}
+async function trackingFetaLoadReviews() {
+  try {
+    const result = await api('/api/tracking/fedex-email/reviews');
+    const items = Array.isArray(result.items) ? result.items : [];
+    trackingRenderFetaReviews(items);
+    $('trackingFetaMeta').textContent = `待人工复核 ${items.length} 条；主系统状态未自动更新。`;
+    $('trackingFetaMeta').className = 'muted';
+    return items.length;
+  } catch (error) {
+    $('trackingFetaMeta').textContent = '待复核队列读取失败：' + error.message;
+    $('trackingFetaMeta').className = 'amz-error';
+    return null;
+  }
+}
+async function trackingFetaSyncInbox() {
+  const button = $('trackingFetaSyncBtn'); button.disabled = true;
+  $('trackingFetaMeta').textContent = '正在只读同步 FETA 收件箱…';
+  try {
+    const result = await api('/api/tracking/fedex-email/sync', { method: 'POST' });
+    const reviewCount = await trackingFetaLoadReviews();
+    if (reviewCount !== null) {
+      $('trackingFetaMeta').textContent = `邮箱同步完成：处理 ${Number(result.processed) || 0} 封 · 新事件 ${Number(result.events_saved) || 0} · 待复核 ${reviewCount} 条（未自动接受）。`;
+      $('trackingFetaMeta').className = 'muted';
+    }
+  } catch (error) {
+    $('trackingFetaMeta').textContent = '收件箱同步失败：' + error.message;
+    $('trackingFetaMeta').className = 'amz-error';
+  } finally { button.disabled = false; }
+}
+async function trackingReviewFetaEvent(event, decision) {
+  const id = Number(event && event.id);
+  if (!Number.isInteger(id) || id <= 0) return;
+  const target = event.system_status === 'delivered' ? '已送达' : event.system_status === 'in_transit' ? '运输中' : '只记录事件，不更改主状态';
+  const prompt = decision === 'accept'
+    ? `确认人工接受 FETA 事件 #${id}（${target}）？该操作会写入本地物流系统；不会伪造扫描时间或地点。`
+    : `确认忽略 FETA 事件 #${id}？不会更新本地物流状态。`;
+  if (!window.confirm(prompt)) return;
+  try {
+    const result = await api(`/api/tracking/fedex-email/events/${id}/review`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision }) });
+    const integration = result.integration;
+    if (decision === 'accept' && integration) {
+      const updated = Number(integration.status_updated) || 0;
+      trackingSetNotice(integration.duplicate ? '该 FETA 事件已幂等写入。'
+        : `FETA 事件已接受：匹配 ${Number(integration.matched_orders) || 0} 条订单关联，状态更新 ${updated} 条。`);
+    } else trackingSetNotice('FETA 事件已忽略；本地物流状态未修改。');
+    await Promise.all([trackingFetaLoadReviews(), trackingLoadOrders(), trackingLoadBatch()]);
+  } catch (error) { trackingSetNotice('FETA 复核/写回失败：' + error.message, true); }
+}
+function trackingCloseEvents() { $('trackingEventsPanel').hidden = true; }
+async function trackingRefresh() {
+  await Promise.all([trackingLoadOrders(), trackingLoadBatch(), trackingFetaLoadReviews()]);
+}
+$('trackingPairs').addEventListener('input', trackingUpdatePairsMeta);
+$('trackingEventsClose').addEventListener('click', trackingCloseEvents);
+
 /* ---------- Amazon US price workspace: start ---------- */
 // 与旧 BSR 功能的 amzTimer / amzJobId 完全隔离；页签切换不取消任何任务。
 const amzPriceState = {
@@ -1828,11 +2258,15 @@ function amzInitSellerSprite() {
 }
 function amzShowPage() {
   const amazon = window.location.hash === '#amazon';
-  $('amzPanelSellersprite').hidden = amazon;
+  const tracking = window.location.hash === '#track17';
+  $('amzPanelSellersprite').hidden = amazon || tracking;
   $('amzPanelAmazon').hidden = !amazon;
-  $('amzTabSellersprite').setAttribute('aria-selected', String(!amazon));
+  $('amzPanelTracking').hidden = !tracking;
+  $('amzTabSellersprite').setAttribute('aria-selected', String(!amazon && !tracking));
   $('amzTabAmazon').setAttribute('aria-selected', String(amazon));
+  $('amzTabTracking').setAttribute('aria-selected', String(tracking));
   if (amazon) amzReload();
+  else if (tracking) trackingRefresh();
   else amzInitSellerSprite();
 }
 $('amzAsins').addEventListener('input', amzOnAsinInput);

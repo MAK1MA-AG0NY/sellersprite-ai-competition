@@ -134,6 +134,13 @@ web_server.py  ──┬── sellersprite_deep_dive.py   （历史 / 查询 / 
 .\run_sellersprite.ps1 -LoginOnly
 ```
 
+### FedEx 邮件追踪（实验功能）
+
+- 配置模板为 `.env.feta.example`；复制为本机 `.env.feta` 后填写 Gmail 应用专用密码。`DRY_RUN` 默认开启；数据库 `deep_results/feta.sqlite3` 与主订单库分开，二者和 `.env.feta` 均不入库。
+- 网页物流页可只读同步收件箱、列出待复核结果；只有人工确认“接受”才会尝试写回主物流状态。仅 `IN_TRANSIT` / `DELIVERED` 有状态映射；其他状态只记事件。收件时间不当作扫描时间，ETA 保留原文。
+- 网页不会发送查询邮件；出站仍使用 `python -m feta query send --confirm-send`，且只有设置 `DRY_RUN=false` 后才允许提交。收件使用 `python -m feta inbox fetch --confirm-network`；网页按钮也只执行收件，不发送。
+- 解析器置信度低，所有结果必须人工复核。目前真实回信样本不足，尚未达到至少三封匿名化真实样本的 P0 验收要求。
+
 ### 环境变量
 
 | 变量 | 说明 |

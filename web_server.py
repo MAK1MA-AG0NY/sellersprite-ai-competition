@@ -27,6 +27,11 @@ import local_db
 import make_report
 import ads_insights as adv
 import amazon_patrol as amz
+import tracking_store as track_store
+import tracking_import as track_import
+import feta.config as feta_config
+import feta.repository as feta_repo
+import feta.service as feta_service
 
 BASE = sd.BASE
 HERE = sd.HERE
@@ -2102,6 +2107,135 @@ async def amazon_changes(asin: str = "", limit: int = 100, group_id: int | None 
         raise HTTPException(400, "ASIN 格式错误")
     group = _amazon_group(group_id) if group_id is not None else None
     return {"items": local_db.amz_changes(asin or None, limit, group_id=group["id"] if group else None)}
+
+
+# ---------- 17TRACK 人工查询结果导入（不自动访问第三方网站） ----------
+
+@app.get("/api/tracking/orders")
+async def tracking_orders():
+    return {"items": track_store.list_orders(), "max_orders": track_store.MAX_ORDERS,
+            "batch_size": track_store.BATCH_SIZE}
+
+
+@app.post("/api/tracking/orders")
+async def tracking_add_orders(req: dict):
+    pairs = req.get("pairs")
+    if not isinstance(pairs, list):
+        raise HTTPException(400, "pairs 必须是订单号-跟踪号数组")
+    try:
+        return track_store.add_pairs(pairs)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/tracking/next-batch")
+async def tracking_next_batch(limit: int = 40):
+    if limit < 1 or limit > track_store.BATCH_SIZE:
+        raise HTTPException(400, f"limit 必须在 1–{track_store.BATCH_SIZE} 之间")
+    items = track_store.next_batch(limit=limit)
+    return {"items": items, "total": track_store.pending_count()}
+
+
+@app.post("/api/tracking/import-summary")
+async def tracking_import_summary(req: dict):
+    text = req.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(400, "请粘贴17TRACK复制的查询概要")
+    parsed = track_import.parse_summary(text)
+    result = track_store.import_records(parsed["records"])
+    return {**result, "errors": parsed["errors"]}
+
+
+@app.post("/api/tracking/orders/{order_row_id}/enabled")
+async def tracking_set_enabled(order_row_id: int, req: dict):
+    if type(req.get("enabled")) is not bool:
+        raise HTTPException(400, "enabled 必须是布尔值")
+    try:
+        return {"item": track_store.set_enabled(order_row_id, req["enabled"])}
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.delete("/api/tracking/orders/{order_row_id}")
+async def tracking_delete_order(order_row_id: int):
+    try:
+        return {"deleted": track_store.remove_order(order_row_id)}
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.get("/api/tracking/orders/{order_row_id}/events")
+async def tracking_order_events(order_row_id: int):
+    try:
+        return {"items": track_store.events(order_row_id)}
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+def _tracking_feta_settings():
+    try:
+        return feta_config.load_settings()
+    except feta_config.ConfigError as exc:
+        raise HTTPException(503, f"FETA 配置无效：{exc}") from exc
+
+
+@app.get("/api/tracking/fedex-email/reviews")
+async def tracking_fedex_email_reviews():
+    settings = _tracking_feta_settings()
+    try:
+        items = await asyncio.to_thread(feta_repo.review_events, db_path=settings.db_path)
+    except Exception as exc:
+        raise HTTPException(503, f"无法读取 FETA 待复核事件（{type(exc).__name__}）") from exc
+    for item in items:
+        item["system_status"] = track_store.feta_target_status(item.get("normalized_status"))
+    return {"items": items, "total": len(items)}
+
+
+@app.post("/api/tracking/fedex-email/sync")
+async def tracking_fedex_email_sync():
+    settings = _tracking_feta_settings()
+    if not settings.imap_configured:
+        raise HTTPException(503, "FETA IMAP 尚未配置；请检查本地 .env.feta")
+    try:
+        result = await asyncio.to_thread(feta_service.fetch_inbox, settings)
+    except feta_config.ConfigError as exc:
+        raise HTTPException(503, f"FETA 邮箱配置错误：{exc}") from exc
+    except PermissionError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"FETA 收件箱同步失败（{type(exc).__name__}）；主物流状态未修改") from exc
+    return result
+
+
+@app.post("/api/tracking/fedex-email/events/{event_id}/review")
+async def tracking_fedex_email_review(event_id: int, req: dict):
+    if set(req) != {"decision"} or req.get("decision") not in {"accept", "ignore"}:
+        raise HTTPException(400, "decision 必须是 accept 或 ignore")
+    settings = _tracking_feta_settings()
+    try:
+        pending = await asyncio.to_thread(feta_repo.review_events, db_path=settings.db_path)
+        event = next((item for item in pending if item["id"] == event_id), None)
+        if event is None:
+            raise HTTPException(404, "FETA 待复核事件不存在或已处理")
+        if req["decision"] == "ignore":
+            reviewed = await asyncio.to_thread(feta_service.review_event, event_id, "ignore", settings)
+            return {"review": reviewed, "integration": None}
+
+        await asyncio.to_thread(feta_repo.validate_review_event, event_id, "accept", db_path=settings.db_path)
+        integration = await asyncio.to_thread(track_store.apply_feta_event, event)
+        if not integration["matched"]:
+            raise HTTPException(409, "跟踪号在当前物流系统中没有匹配项；事件仍保持待复核，未写入主系统")
+        try:
+            reviewed = await asyncio.to_thread(feta_service.review_event, event_id, "accept", settings)
+        except ValueError as exc:
+            raise HTTPException(409, f"主系统已幂等保存该事件，但 FETA 复核未完成；可安全重试：{exc}") from exc
+        return {"review": reviewed, "integration": integration}
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, f"复核/写回失败（{type(exc).__name__}）") from exc
 
 
 # ---------- 页面 ----------

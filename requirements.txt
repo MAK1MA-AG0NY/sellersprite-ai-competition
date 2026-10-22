@@ -6,3 +6,4 @@ openpyxl==3.1.5
 et-xmlfile==2.0.0
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
+tzdata>=2024.1
