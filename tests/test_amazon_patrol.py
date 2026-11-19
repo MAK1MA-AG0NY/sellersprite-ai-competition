@@ -74,6 +74,17 @@ class PriceParserTests(unittest.TestCase):
         with self.assertRaises(patrol.ObservationError):
             patrol.normalize_observation(ASIN, raw_product(), "https://example.com/product")
 
+    def test_precise_offer_types_require_explicit_evidence(self):
+        no_offer = patrol.classify_offers({"offer_regions_seen": True, "coupon_text": "", "promotions_text": ""},
+                                          price="299.00", reference_price="399.00")
+        self.assertEqual(no_offer["offer_types"], ["reference_discount"])
+        self.assertNotIn("lightning_deal", no_offer["offer_types"])
+        self.assertIn("不构成秒杀证据", no_offer["offer_evidence"][0]["text"])
+        explicit = patrol.classify_offers({"offer_regions_seen": True, "coupon_text": "Save $20 with coupon",
+                                           "promotions_text": "Lightning Deal · Prime Exclusive Deal"})
+        self.assertEqual(set(explicit["offer_types"]), {"lightning_deal", "prime_exclusive", "coupon"})
+        self.assertEqual(patrol.classify_offers({"offer_regions_seen": False, "coupon_text": "", "promotions_text": ""})["offer_read_status"], "not_read")
+
     def test_unavailable_is_explicit_and_does_not_invent_a_price(self):
         data, note = patrol.normalize_observation(
             ASIN, raw_product(price_text="", availability_text="Currently unavailable"), patrol.product_url(ASIN))
@@ -168,6 +179,22 @@ class MemoryDBTests(unittest.TestCase):
         self.assertEqual(restored["changes"], {"availability": {"old": "unavailable", "new": "available"}})
         self.assertEqual(len(local_db.amz_changes()), 2)
 
+    def test_successful_checks_append_observations_while_unread_offers_are_preserved(self):
+        first = {"price": "299.00", "currency": "USD", "offer_types": ["coupon"],
+                 "offer_evidence": [{"type": "coupon", "source": "coupon_region", "text": "Save $20"}],
+                 "offer_read_status": "observed", "offer_observed_at": "2026-01-01T00:00:00+00:00"}
+        local_db.amz_record(ASIN, first, checked_at="2026-01-01T00:00:00+00:00")
+        local_db.amz_record(ASIN, {"price": "299.00", "offer_read_status": "not_read"},
+                            checked_at="2026-01-02T00:00:00+00:00")
+        self.assertEqual(self.current()["offer_types"], ["coupon"])
+        observations = local_db.amz_observations()
+        self.assertEqual(observations["total"], 2)
+        latest = observations["items"][0]["data"]
+        self.assertEqual(latest["offer_types"], ["coupon"])
+        self.assertEqual(latest["offer_read_status"], "not_read")
+        local_db.amz_record_error(ASIN, "captcha")
+        self.assertEqual(local_db.amz_observations()["total"], 2)
+
     def test_change_and_current_update_roll_back_together(self):
         local_db.amz_record(ASIN, {"price": "299.00"})
         c = local_db._conn()
@@ -204,6 +231,150 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved["items"][0]["asin"], ASIN)
             self.assertEqual((await self.server.amazon_changes())["items"], [])
             seller_browser.assert_not_awaited()
+
+    async def test_product_comparison_rule_analysis_context_and_default_off_schedule(self):
+        import os
+        group_id = (await self.server.amazon_groups())["default_group_id"]
+        await self.server.amazon_save_watch({"group_id": group_id, "asins": ASIN})
+        local_db.amz_record(ASIN, {"price": "249.00", "currency": "USD", "availability": "available",
+                               "offer_types": ["coupon"], "offer_evidence": [{"source": "coupon", "text": "Save $10"}]})
+        saved = await self.server.amazon_save_product({"group_id": group_id, "name": "Own Product", "asin": OTHER,
+            "spec_notes": "battery capacity", "manual_price": "299.00", "protected_floor": "220.00",
+            "currency": "USD", "price_source": "manual"})
+        self.assertEqual(saved["product"]["manual_price"], "299.00")
+        comparison = await self.server.amazon_comparison_view(group_id)
+        self.assertEqual(comparison["comparisons"][0]["asin"], ASIN)
+        self.assertEqual(comparison["comparisons"][0]["delta_vs_own"], "-50.00")
+        rules = await self.server.amazon_analysis({"group_id": group_id, "mode": "rules"})
+        self.assertEqual(rules["analysis"]["kind"], "rule")
+        context = await self.server.amazon_analysis_context({"group_id": group_id})
+        self.assertEqual(context["type"], "seller-sprite-amazon-analysis-context")
+        self.assertFalse(any("order" in key.lower() or "cookie" in key.lower() for key in context["context"]))
+        with patch.dict(os.environ, {}, clear=True):
+            ai = await self.server.amazon_analysis({"group_id": group_id, "mode": "ai"})
+            self.assertEqual(ai["status"], "ai_disabled")
+            self.assertFalse((await self.server.amazon_ai_status())["enabled"])
+        schedule = await self.server.amazon_schedule_get(group_id)
+        self.assertFalse(schedule["schedule"]["enabled"])
+        with patch.dict(os.environ, {"WEB_CONCURRENCY": "1"}):
+            enabled = await self.server.amazon_schedule_save({"group_id": group_id, "enabled": True,
+                "local_time": "08:30", "timezone": "Asia/Shanghai"})
+        self.assertTrue(enabled["schedule"]["enabled"])
+        self.assertEqual(enabled["schedule"]["local_time"], "08:30")
+        observations = await self.server.amazon_observations(group_id=group_id)
+        self.assertEqual(observations["total"], 1)
+
+    async def test_observed_own_product_is_collectible_without_competitor_membership_and_can_switch(self):
+        group_id = (await self.server.amazon_groups())["default_group_id"]
+        await self.server.amazon_save_product({"group_id": group_id, "name": "Own A", "asin": "B000000001",
+            "price_source": "observed", "currency": "USD"})
+        self.assertEqual(local_db.amz_watchlist(group_id), [])
+        first = local_db.amz_record("B000000001", {"price":"100.00","currency":"USD","availability":"available"})
+        self.assertEqual(first["status"], "baseline")
+        await self.server.amazon_save_product({"group_id": group_id, "name": "Own B", "asin": "B000000002",
+            "price_source": "observed", "currency": "USD"})
+        self.assertEqual(local_db.amz_watchlist(group_id), [])
+        second = local_db.amz_record("B000000002", {"price":"120.00","currency":"USD","availability":"available"})
+        self.assertEqual(second["status"], "baseline")
+        self.assertEqual(local_db.amz_observations(group_id)["total"], 1)
+        self.assertEqual(local_db.amz_observations()["total"], 2)
+        await self.server.amazon_save_watch({"group_id": group_id, "asins": "B000000003"})
+        local_db.amz_record("B000000003", {"price":"90.00","currency":"USD","availability":"available"})
+        await self.server.amazon_save_product({"group_id": group_id, "name": "Shared own", "asin": "B000000003",
+            "price_source": "observed", "currency": "USD"})
+        changed = local_db.amz_record("B000000003", {"price":"95.00","currency":"USD","availability":"available"})
+        self.assertEqual(changed["status"], "changed")
+        self.assertEqual([item["asin"] for item in local_db.amz_watchlist(group_id)], ["B000000003"])
+
+    async def test_simple_today_view_is_honest_and_run_ignores_legacy_own_asin(self):
+        group_id = (await self.server.amazon_groups())["default_group_id"]
+        own_asin = "B000000099"
+        await self.server.amazon_save_product({"group_id":group_id,"name":"Legacy name","asin":own_asin,
+            "spec_notes":"keep legacy spec","manual_price":"299.00","protected_floor":"200.00",
+            "currency":"USD","price_source":"observed"})
+        asins = ["B000000001","B000000002","B000000003","B000000004","B000000005",
+                 "B000000006","B000000007","B000000008","B000000009","B000000010","B000000011"]
+        await self.server.amazon_save_watch({"group_id":group_id,"asins":"\n".join(asins)})
+        now = self.server.datetime.now(self.server.AMZ_SHANGHAI).isoformat(timespec="seconds")
+        yesterday = (self.server.datetime.now(self.server.AMZ_SHANGHAI) - self.server.timedelta(days=1)).isoformat(timespec="seconds")
+        for asin, price in zip(asins[:3], ("249.00","299.00","329.00")):
+            local_db.amz_record(asin, {"title":"Synthetic product","price":price,"currency":"USD","availability":"available",
+                "offer_read_status":"observed","offer_observed_at":now,
+                "offer_evidence":[{"type":"coupon","text":"Save $20 with coupon"}]}, checked_at=now)
+        local_db.amz_record(asins[3], {"price":"100.00","currency":"USD","availability":"available"}, checked_at=yesterday)
+        local_db.amz_record(asins[4], {"price":"90.00","currency":"USD","availability":"available"}, checked_at=yesterday)
+        local_db.amz_record(asins[5], {"price":"80.00","currency":"USD","availability":"available",
+            "offer_read_status":"observed","offer_observed_at":now,
+            "offer_evidence":[{"type":"coupon","text":"Stale today coupon"}]}, checked_at=now)
+        conn = local_db._conn()
+        conn.execute("UPDATE amz_watch SET last_checked=?,last_status='error',last_error='Synthetic failure' WHERE asin=?", (now, asins[5])); conn.commit(); conn.close()
+        local_db.amz_record(asins[6], {"price":"70.00","currency":"USD","availability":"available",
+            "offer_read_status":"observed","offer_observed_at":now,
+            "offer_evidence":[{"type":"coupon","text":"Stale today coupon"}]}, checked_at=now)
+        local_db.amz_record(asins[6], {"price":"70.00","currency":"USD","availability":"out_of_stock"}, checked_at=now)
+        local_db.amz_record(asins[7], {"price":"60.00","currency":"EUR","availability":"available"}, checked_at=now)
+        local_db.amz_record(asins[8], {"price":"10.00","currency":"USD","availability":"available"}, checked_at=now)
+        conn = local_db._conn(); conn.execute("UPDATE amz_watch SET last_status=NULL WHERE asin=?", (asins[8],)); conn.commit(); conn.close()
+        local_db.amz_record(asins[9], {"price":"200.00","currency":"USD",
+            "offer_read_status":"not_read"}, checked_at=now)
+        local_db.amz_record(asins[10], {"price":"5.00","currency":"USD","availability":"unavailable"}, checked_at=now)
+        conn = local_db._conn()
+        conn.execute("UPDATE amz_group_products SET updated_at='2020-01-01T00:00:00+08:00' WHERE group_id=?", (group_id,)); conn.commit(); conn.close()
+        state = await self.server.amazon_simple_state(group_id)
+        rows = {row["asin"]: row for row in state["items"]}
+        self.assertTrue(rows[asins[0]]["below_own_price"])
+        self.assertIn("$50.00", rows[asins[0]]["comparison"])
+        self.assertFalse(rows[asins[1]]["below_own_price"])
+        self.assertEqual(rows[asins[1]]["comparison"], "与本品相同")
+        self.assertFalse(rows[asins[2]]["below_own_price"])
+        self.assertFalse(rows[asins[3]]["below_own_price"])
+        self.assertEqual(rows[asins[3]]["price"], "—")
+        self.assertEqual(rows[asins[3]]["offer"], "—")
+        self.assertEqual(rows[asins[4]]["status"], "今天未巡查")
+        self.assertEqual(rows[asins[4]]["price"], "—")
+        self.assertEqual(rows[asins[5]]["status"], "采集失败")
+        self.assertEqual(rows[asins[5]]["offer"], "采集失败，优惠未确认")
+        self.assertFalse(rows[asins[5]]["below_own_price"])
+        self.assertEqual(rows[asins[6]]["status"], "今日缺货 / 不可购买")
+        self.assertEqual(rows[asins[6]]["offer"], "缺货时优惠不可确认")
+        self.assertFalse(rows[asins[6]]["below_own_price"])
+        self.assertEqual(rows[asins[7]]["status"], "非 USD，不比较")
+        self.assertFalse(rows[asins[7]]["below_own_price"])
+        self.assertEqual(rows[asins[8]]["status"], "今日状态未确认")
+        self.assertEqual(rows[asins[8]]["price"], "—")
+        self.assertFalse(rows[asins[8]]["below_own_price"])
+        self.assertEqual(rows[asins[0]]["offer"], "Save $20 with coupon")
+        self.assertTrue(rows[asins[9]]["below_own_price"])
+        self.assertEqual(rows[asins[9]]["status"], "今日已检查（库存未确认）")
+        self.assertEqual(rows[asins[9]]["offer"], "本次优惠未读取")
+        self.assertIn("低于本品 $99.00", rows[asins[9]]["comparison"])
+        self.assertEqual(rows[asins[10]]["status"], "今日缺货 / 不可购买")
+        self.assertEqual(rows[asins[10]]["price"], "—")
+        self.assertFalse(rows[asins[10]]["below_own_price"])
+        await self.server.amazon_save_reference_price({"group_id":group_id,"price":None})
+        no_reference = await self.server.amazon_simple_state(group_id)
+        self.assertFalse(any(row["below_own_price"] for row in no_reference["items"]))
+        self.assertEqual(no_reference["items"][0]["comparison"], "未设本品价")
+        observations_before = local_db.amz_observations(group_id=group_id)
+        changes_before = local_db.amz_changes(group_id=group_id)
+        saved = await self.server.amazon_save_reference_price({"group_id":group_id,"price":"310.00"})
+        self.assertEqual(saved["reference_price"], "310.00")
+        self.assertEqual(local_db.amz_observations(group_id=group_id), observations_before)
+        self.assertEqual(local_db.amz_changes(group_id=group_id), changes_before)
+        product = local_db.amz_get_product(group_id)
+        self.assertEqual((product["name"],product["asin"],product["spec_notes"],product["protected_floor"],product["price_source"]),
+                         ("Legacy name",own_asin,"keep legacy spec","200.00","observed"))
+        twenty = [f"B{i:09d}" for i in range(20)]
+        await self.server.amazon_save_watch({"group_id":group_id,"asins":"\n".join(twenty)})
+        observed = []; finished = asyncio.Event()
+        async def fake_run(run_asins, job):
+            observed.extend(run_asins); job["status"] = "done"; finished.set()
+        with patch.object(self.server.amz, "run_patrol", side_effect=fake_run):
+            await self.server.amazon_run({"group_id":group_id,"simple_mode":True})
+            await asyncio.wait_for(finished.wait(), 2)
+            await asyncio.sleep(0)
+        self.assertEqual(len(observed), 20)
+        self.assertNotIn(own_asin, observed)
 
     async def test_duplicate_run_and_watch_edit_are_rejected_while_running(self):
         from fastapi import HTTPException
@@ -492,87 +663,49 @@ class BrowserSelectorTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
-    async def test_amazon_tab_is_isolated_and_renders_external_text_safely(self):
+    async def test_amazon_tab_loads_only_the_simple_fixture_state(self):
         from playwright.async_api import async_playwright
         html = (Path(__file__).resolve().parents[1] / "web_index.html").read_text(encoding="utf-8")
         calls = []
-        malicious = '<img src=x onerror="window.amzInjected=true">'
-        item = {"asin": ASIN, "url": "javascript:alert(1)",
-                "current": {"title": malicious, "price": "299.00", "coupon": malicious},
-                "last_status": "baseline", "last_checked": "2026-01-01", "last_error": ""}
-        change = {"price": {"old": "299.00", "new": "279.00"}}
-
-        async def fake_server(route):
-            from urllib.parse import urlsplit
-            path = urlsplit(route.request.url).path
-            calls.append((path, route.request.method))
-            if path == "/":
-                await route.fulfill(content_type="text/html", body=html)
-                return
-            if path == "/api/amazon/groups":
-                data = {"items": [{"id": 1, "name": "默认分组", "count": 1}], "default_group_id": 1,
-                        "running_job_id": None}
-            elif path == "/api/amazon/watch":
-                data = {"items": [item], "group_id": 1, "group_name": "默认分组", "max_asins": 20,
-                        "running_job_id": None}
-            elif path == "/api/amazon/changes":
-                data = {"items": [{"id": 1, "asin": ASIN, "checked_at": "2026-01-02", "changes": change}]}
-            elif path == "/api/amazon/run":
-                data = {"job_id": "fixture-job", "group_id": 1, "group_name": "默认分组"}
-            elif path == "/api/job/fixture-job":
-                data = {"group_id": 1, "group_name": "默认分组", "status": "done", "done": 1, "total": 1, "changed": 1,
-                        "baselines": 0, "unchanged": 0, "failed": 0, "log": [malicious],
-                        "results": [{"asin": ASIN, "status": "changed", "changes": change, "message": malicious}]}
-            elif path == "/api/accounts":
-                data = {"main": {"logged_in": False}, "member": {"logged_in": False},
-                        "db": {"snapshots": 0, "asins": 0, "batches": 0}}
-            elif path == "/api/pool":
-                data = {"slots": [], "next_slot": 1}
-            elif path == "/api/watchlist":
-                data = {"items": [], "count": 0, "own": 0, "blocked": {}, "bsr_configured": []}
-            elif path == "/api/bsr/sources":
-                data = {"items": []}
-            elif path == "/api/routine/plan":
-                data = {"plan": [], "last_run": []}
+        malicious = '<img src=x onerror="window.injected=true">'
+        async def fixture(route):
+            from urllib.parse import urlsplit, parse_qs
+            parsed=urlsplit(route.request.url); path=parsed.path; calls.append(path)
+            if path == "/": data=html; content_type="text/html"
+            elif path == "/api/amazon/groups":
+                payload={"items":[{"id":1,"name":"合成组","count":1}],"default_group_id":1,"running_job_id":None}
+                await route.fulfill(content_type="application/json",body=json.dumps(payload)); return
+            elif path == "/api/amazon/simple":
+                payload={"group_id":1,"group_name":"合成组","asins":[ASIN],"reference_price":"299.00","today":"2026-10-21",
+                    "items":[{"asin":ASIN,"title":malicious,"price":"$249.00","offer":"Save $10","below_own_price":True,
+                    "comparison":"低于本品 $50.00","checked_at":"10-21 09:00","status":"今日已检查"}],
+                    "running_job_id":None}
+                await route.fulfill(content_type="application/json",body=json.dumps(payload)); return
             else:
-                await route.abort()
-                return
-            await route.fulfill(content_type="application/json", body=json.dumps(data))
-
+                await route.abort(); return
+            await route.fulfill(content_type=content_type,body=data)
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
+            browser=await pw.chromium.launch(headless=True)
             try:
-                page = await browser.new_page(viewport={"width": 1440, "height": 1100})
-                errors = []
-                page.on("pageerror", lambda error: errors.append(str(error)))
-                await page.route("**/*", fake_server)
+                page=await browser.new_page(viewport={"width":1280,"height":900})
+                errors=[]; page.on("pageerror",lambda error:errors.append(str(error)))
+                await page.route("**/*",fixture)
                 await page.goto("http://mvp.test/#amazon")
-                await page.wait_for_function("document.querySelector('#amzCurrentBody').textContent.includes('299.00')")
-                self.assertTrue(await page.locator("#amzPanelAmazon").is_visible())
-                self.assertFalse(await page.locator("#amzPanelSellersprite").is_visible())
-                self.assertTrue(all(path == "/" or path.startswith("/api/amazon/") for path, _ in calls))
-                self.assertIn(malicious, await page.locator("#amzCurrentBody").inner_text())
-                self.assertEqual(await page.locator("#amzCurrentBody img").count(), 0)
-                self.assertFalse(await page.evaluate("Boolean(window.amzInjected)"))
-                self.assertEqual(await page.locator("#amzCurrentBody a").get_attribute("href"), patrol.product_url(ASIN))
-                self.assertTrue(await page.locator("#amzScheduleBtn").is_disabled())
-                await page.locator("#amzAsins").fill(ASIN.lower())
-                await page.locator("#amzSaveBtn").click()
-                await page.wait_for_function("!document.querySelector('#amzRunBtn').disabled")
-                await page.locator("#amzRunBtn").click()
-                await page.wait_for_function("document.querySelector('#amzProgressText').textContent.includes('有差异 1')")
-                self.assertIn("299.00 → 279.00", await page.locator("#amzResultsBody").inner_text())
-                await page.locator("#amzTabSellersprite").click()
-                await page.wait_for_function("!document.querySelector('#amzPanelSellersprite').hidden")
-                await page.wait_for_function("document.querySelector('#main-badge').textContent.includes('未登录')")
-                await page.locator("#amzTabAmazon").click()
-                await page.wait_for_function("!document.querySelector('#amzPanelAmazon').hidden")
-                await page.locator("#amzTabSellersprite").click()
-                self.assertEqual(sum(path == "/api/accounts" for path, _ in calls), 1)
-                self.assertEqual(errors, [])
+                await page.wait_for_function("document.querySelector('#amzTodayBody td:first-child a') !== null")
+                self.assertEqual(await page.locator("#amzPanelAmazon > .card").count(),2)
+                self.assertEqual(await page.locator("#amzTodayBody img").count(),0)
+                link=page.locator("#amzTodayBody tr").first.locator("td:first-child a")
+                self.assertEqual(await link.inner_text(),malicious)
+                self.assertEqual(await link.get_attribute("href"),f"https://www.amazon.com/dp/{ASIN}")
+                self.assertNotIn(ASIN,await page.locator("#amzTodayBody tr").first.locator("td:first-child").inner_text())
+                self.assertTrue(await page.locator("#amzTodayBody tr").first.evaluate("el => el.classList.contains('amz-low-row')"))
+                self.assertEqual(set(calls),{"/","/api/amazon/groups","/api/amazon/simple"})
+                for legacy in ("/api/amazon/comparison","/api/amazon/observations","/api/amazon/analyses","/api/amazon/analysis","/api/amazon/ai-status","/api/amazon/schedule"):
+                    self.assertNotIn(legacy,calls)
+                self.assertFalse(await page.evaluate("Boolean(window.injected)"))
+                self.assertEqual(errors,[])
             finally:
                 await browser.close()
-
 
 if __name__ == "__main__":
     unittest.main()

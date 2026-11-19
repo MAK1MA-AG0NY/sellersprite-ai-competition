@@ -17,6 +17,7 @@ import glob
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import openpyxl
@@ -577,17 +578,25 @@ def _check_api(j):
         raise RuntimeError(f"接口错误 {code}: {text}")
 
 
-async def _api_get(page, url):
+async def _api_get(page, url, metrics=None):
     fetch_get = ("async (u) => { const r = await fetch(u, "
                  "{headers: {'accept':'application/json'}}); "
                  "return {s: r.status, j: await r.json().catch(() => null)}; }")
-    r = await page.evaluate(fetch_get, url)
+    started = time.perf_counter()
+    status_code = None
+    try:
+        r = await page.evaluate(fetch_get, url)
+        status_code = (r or {}).get("s") if isinstance(r, dict) else None
+    finally:
+        if metrics is not None:
+            metrics.setdefault("api_ms", []).append(round((time.perf_counter() - started) * 1000))
+            metrics.setdefault("api_statuses", []).append(status_code)
     j = (r or {}).get("j")
     _check_api(j)
     return j
 
 
-async def fetch_ads_groups(page, asin, market_id=1, months=6, interval="week"):
+async def fetch_ads_groups(page, asin, market_id=1, months=6, interval="week", metrics=None):
     """
     纯 API 拉取一个 ASIN 的全部广告组（含每周 keywordsCount 时间线）。
     page 需已处于 sellersprite 同源页面（登录态任意）。
@@ -598,6 +607,9 @@ async def fetch_ads_groups(page, asin, market_id=1, months=6, interval="week"):
     """
     groups, page_num, meta = [], 1, {}
     fetched, skipped = 0, 0
+    if metrics is not None:
+        metrics.setdefault("api_ms", [])
+        metrics["debug_write_ms"] = 0
     dbg = HERE / "ads_debug"
     dbg.mkdir(exist_ok=True)
     asin_u = str(asin).strip().upper()
@@ -605,12 +617,16 @@ async def fetch_ads_groups(page, asin, market_id=1, months=6, interval="week"):
         url = (f"{XDS_STAT}?asin={asin}&market={market_id}&interval={interval}&desc=false"
                f"&pageNum={page_num}&pageSize=50&orderByEffectiveness=false"
                f"&months={months}&combination=false")
-        j = await _api_get(page, url)
+        j = await _api_get(page, url, metrics=metrics)
+        dump_started = time.perf_counter()
         try:
             (dbg / f"xds_p{page_num}_{asin}.json").write_text(
                 json.dumps({"url": url, "resp": j}, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
+        finally:
+            if metrics is not None:
+                metrics["debug_write_ms"] += round((time.perf_counter() - dump_started) * 1000)
         d = j.get("data") or {}
         gs = d.get("groups") or []
         fetched += len(gs)
@@ -630,18 +646,20 @@ async def fetch_ads_groups(page, asin, market_id=1, months=6, interval="week"):
 
 async def fetch_group_keywords(page, ad_id, begin_date, end_date,
                                market_id=1, interval="week", page_size=50, max_pages=2,
-                               asin=None):
+                               asin=None, metrics=None):
     """某广告组在某周的关键词列表（限 max_pages 页，避免全量翻页触发风控）。
     ⚠️ ASIN 归属约束（第二层）：组合/店铺型广告组即使归属目标 ASIN，组内也会混投
     该卖家的其他产品（如电站 ASIN 的组里混进充电头/耳机词，每行的 asin 字段
     = 该词实际投放的商品 ASIN）。传入 asin 时只保留行级 asin == 目标 ASIN 的关键词。"""
     items, page_num = [], 1
+    if metrics is not None:
+        metrics.setdefault("api_ms", [])
     while page_num <= max_pages:
         url = (f"{XDS_STAT}/keyword?adId={ad_id}&interval={interval}"
                f"&beginDate={begin_date}&endDate={end_date}"
                f"&pageSize={page_size}&pageNum={page_num}&keyword="
                f"&orderField=updatedTime&desc=true&market={market_id}")
-        j = await _api_get(page, url)
+        j = await _api_get(page, url, metrics=metrics)
         d = j.get("data") or {}
         its = d.get("items") or []
         items.extend(its)

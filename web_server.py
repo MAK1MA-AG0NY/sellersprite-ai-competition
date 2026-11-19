@@ -9,15 +9,19 @@
 """
 
 import asyncio
+import hashlib
 import json
+import os
 import re
 import time
 import random
-from datetime import date, datetime
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from playwright.async_api import async_playwright
 
@@ -29,9 +33,19 @@ import ads_insights as adv
 import amazon_patrol as amz
 import tracking_store as track_store
 import tracking_import as track_import
+import usps_browser
 import feta.config as feta_config
 import feta.repository as feta_repo
 import feta.service as feta_service
+import amazon_comparison
+import amazon_scheduler
+
+AMZ_SCHEDULER = None
+AMZ_TASKS: set[asyncio.Task] = set()
+USPS_QUERY = usps_browser.USPSQuerySession()
+TRACK718_QUERY = usps_browser.Track718QuerySession()
+AMZ_SHANGHAI = timezone(timedelta(hours=8))
+AMZ_BULK_MAX_UNIQUE_ASINS = 200
 
 BASE = sd.BASE
 HERE = sd.HERE
@@ -66,7 +80,28 @@ async def goto_panel(page, kind, timeout_ms=20000):
             continue
     return False
 
-app = FastAPI(title="SellerSprite Deep-Dive")
+@asynccontextmanager
+async def _lifespan(application):
+    global AMZ_SCHEDULER
+    # 简版巡查只允许按钮启动；保留旧调度存储和 API 兼容，但不启动后台调度器。
+    AMZ_SCHEDULER = None
+    try:
+        yield
+    finally:
+        active_jobs = [task for task in AMZ_TASKS if not task.done()]
+        for task in active_jobs:
+            task.cancel()
+        if active_jobs:
+            await asyncio.gather(*active_jobs, return_exceptions=True)
+        await asyncio.gather(USPS_QUERY.cancel(), TRACK718_QUERY.cancel(), return_exceptions=True)
+        for job in S.get("jobs", {}).values():
+            if job.get("type") == "amazon_price" and job.get("status") == "running":
+                job["status"] = "error"
+                job["detail"] = "服务正在关闭；未完成巡查已安全中断，可在服务重新启动后人工重试。"
+        AMZ_SCHEDULER = None
+
+
+app = FastAPI(title="SellerSprite Deep-Dive", lifespan=_lifespan)
 
 S = {
     "pw": None, "browser": None,
@@ -132,10 +167,18 @@ async def get_main_page():
         browser = await get_browser()
         ctx = await browser.new_context(storage_state=str(STATE_FILE))
         ctx.set_default_timeout(30_000)
-        page = await ctx.new_page()
-        await page.goto(f"{BASE}/v3/ai-history?module=CL", wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-        await _check_login(page, "主账号")   # 失效则抛错，坏页面不缓存
+        try:
+            page = await ctx.new_page()
+            # API flows only need an authenticated same-origin document. Avoid hydrating the full CL SPA;
+            # DOM workflows explicitly navigate to their required panel via goto_panel().
+            await page.goto(f"{BASE}/v3/api/client", wait_until="domcontentloaded")
+            await _check_login(page, "主账号")   # 失效则抛错，坏页面不缓存
+        except Exception:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+            raise
         S["main_page"] = page
     return S["main_page"]
 
@@ -144,10 +187,17 @@ async def get_vip_page():
         browser = await get_browser()
         ctx = await browser.new_context(storage_state=str(MEMBER_STATE_FILE))
         ctx.set_default_timeout(60_000)
-        page = await ctx.new_page()
-        await page.goto(f"{BASE}/v3/competitor-lookup", wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-        await _check_login(page, "会员账号")
+        try:
+            page = await ctx.new_page()
+            # VIP lookups and ad APIs use same-origin fetch; probe_lookup navigates a separate page when DOM is needed.
+            await page.goto(f"{BASE}/v3/api/client", wait_until="domcontentloaded")
+            await _check_login(page, "会员账号")
+        except Exception:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+            raise
         S["vip_page"] = page
     return S["vip_page"]
 
@@ -298,20 +348,31 @@ async def pool_remove(slot: int):
 @app.get("/api/accounts")
 async def accounts():
     out = {}
+    pages = {}
+    # 页面首次创建需要访问 SellerSprite；顺序初始化可避免竞争创建共享 Browser。
     for role, path in (("main", STATE_FILE), ("member", MEMBER_STATE_FILE)):
         if not path.exists():
             out[role] = {"logged_in": False}
             continue
         try:
-            page = await (get_main_page() if role == "main" else get_vip_page())
-            j = await sd.api_get(page, "/v3/api/client")
-            d = j.get("data") or {}
-            out[role] = {"logged_in": True, **fmt_account(d)}
+            pages[role] = await (get_main_page() if role == "main" else get_vip_page())
         except Exception as e:
             out[role] = {"logged_in": False, "error": str(e)}
+
+    async def fetch_account(role, page):
+        try:
+            j = await sd.api_get(page, "/v3/api/client")
+            d = j.get("data") or {}
+            return role, {"logged_in": True, **fmt_account(d)}
+        except Exception as e:
+            return role, {"logged_in": False, "error": str(e)}
+
+    if pages:
+        out.update(await asyncio.gather(*(fetch_account(role, page) for role, page in pages.items())))
     out["lookup_cfg"] = LOOKUP_CFG.exists()
     try:
-        out["db"] = local_db.stats()
+        # COUNT(DISTINCT asin) may scan a large local snapshot table; keep it off the ASGI event loop.
+        out["db"] = await asyncio.to_thread(local_db.stats)
     except Exception:
         out["db"] = {"snapshots": 0, "asins": 0, "batches": 0}
     return out
@@ -348,8 +409,9 @@ async def history():
 
 @app.get("/api/task/{task_id}/asins")
 async def task_asins(task_id: str):
+    timings = {}
     page = await get_main_page()
-    asins, ai_rows = await sd.extract_asins(page, task_id)
+    asins, ai_rows = await sd.extract_asins(page, task_id, timings=timings)
     market = next((t.get("market") for t in S["tasks"] if t.get("taskId") == task_id), "US")
     # 种子ASIN = 该 CL 任务 tabTitle 括号里的 ASIN（"我分析的ASIN"，用于报告分页归属）
     t = next((t for t in S["tasks"] if t.get("taskId") == task_id), {})
@@ -359,11 +421,20 @@ async def task_asins(task_id: str):
     S["current_market"] = (market or "US").upper()
     S["current_seed"] = seed
     OUT_DIR.mkdir(exist_ok=True)
-    (OUT_DIR / f"asins_{task_id[:12]}.json").write_text(
-        json.dumps({"taskId": task_id, "seed_asin": seed, "asins": asins, "ai_rows": ai_rows},
-                   ensure_ascii=False, indent=1), encoding="utf-8")
+    snapshot_path = OUT_DIR / f"asins_{task_id[:12]}.json"
+    snapshot = {"taskId": task_id, "seed_asin": seed, "asins": asins, "ai_rows": ai_rows}
+    save_started = time.perf_counter()
+
+    def save_snapshot():
+        payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        snapshot_path.write_text(payload, encoding="utf-8")
+        return snapshot_path.stat().st_size
+
+    saved_bytes = await asyncio.to_thread(save_snapshot)
+    timings["save_ms"] = round((time.perf_counter() - save_started) * 1000)
+    timings["saved_kb"] = round(saved_bytes / 1024, 1)
     return {"taskId": task_id, "seed_asin": seed, "count": len(asins),
-            "preview": asins[:30], "ai_rows_saved": len(ai_rows)}
+            "preview": asins[:30], "ai_rows_saved": len(ai_rows), "timings": timings}
 
 # ---------- 竞品查询（后台任务） ----------
 
@@ -1625,7 +1696,6 @@ async def run_ads_report(job_id: str, min_vol: int, scope: str, backfill: bool):
                 "sources": f"⚡自动抓取 {len(harvest)} 个竞品 + ①导入 {len(imported)} 个来源"}
         make_report.build_ads_report(f["kept"], meta, str(fp),
                                      page_groups=_build_page_groups(f["kept"], _seed_map()))
-        S["last_report"] = str(fp)
         job["xlsx"] = str(fp)
         job["result"] = {"ok": True, "scope": scope, "kept": len(f["kept"]), "dropped": f["dropped"],
                          "total_kw": f["total_kw"], "harvest_asins": len(harvest),
@@ -1657,13 +1727,22 @@ async def ads_clean(req: dict = None):
                                       official=official)
     fp = OUT_DIR / f"{_scope_label('global')}_clean_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
     make_report.build_clean_report(kept, str(fp))   # 总览 + 按来源ASIN分页
-    S["last_report"] = str(fp)
+    S["last_ads_clean_report"] = str(fp)
     return {"ok": True, "kept": len(kept), "total": len(rows), **stat, "file": fp.name}
+
+
+@app.get("/api/ads/clean/download")
+async def ads_clean_download():
+    path = S.get("last_ads_clean_report")
+    if not path or not Path(path).is_file():
+        raise HTTPException(404, "请先生成高相关词清单")
+    return FileResponse(path, filename=Path(path).name)
 
 # ---------- ⑥-B 全自动广告抓取（组结构+关键词收割） ----------
 
-async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: int):
+async def _run_ads_auto_impl(job_id: str, limit: int, top_groups: int, weeks_budget: int):
     job = S["jobs"][job_id]
+    job["phase"], job["detail"] = "准备数据", "读取本地竞品快照…"
     snaps = local_db.latest(S["asins"] or None)
     ranked = sorted(snaps, key=lambda r: -(r.get("totalUnits") or 0))[:limit]
     if not ranked:
@@ -1671,8 +1750,12 @@ async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: i
         job["status"] = "error"
         return
     job["total"] = len(ranked)
+    job["phase"], job["detail"] = "初始化账号", "正在初始化会员账号（VIP）…"
+    job["log"].append("[i] 正在连接会员账号（VIP）")
     page_vip = await get_vip_page()
+    job["detail"] = "正在初始化主账号…"
     page_main = await get_main_page()
+    job["detail"] = "账号已就绪，开始抓取广告组"
     kw_page_choice = {"vip": 0, "main": 0}   # 统计哪种账号能拉关键词
     dead = {"main": False, "vip": False}     # 会话失效的账号自动拉黑
 
@@ -1686,11 +1769,19 @@ async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: i
         job["log"].append(f"—— [A {i}/{len(ranked)}] {asin} 拉组结构（VIP·轻）——")
         if vip_alive:
             try:
-                r = await adv.fetch_ads_groups(page_vip, asin)
+                timing = {}
+                r = await adv.fetch_ads_groups(page_vip, asin, metrics=timing)
+                save_started = time.perf_counter()
                 local_db.save_groups(asin, r)
+                save_ms = round((time.perf_counter() - save_started) * 1000)
                 job["log"].append(f"[+] 组结构已缓存: 自身 {len(r.get('groups') or [])} 组"
                                   f"（接口返回 {r.get('adCount')} 组，剔除发散 ASIN 组 "
                                   f"{r.get('skippedGroups')}）/ 关键词上限 {r.get('maxKeywordsCount')}")
+                api_ms = timing.get("api_ms") or []
+                statuses = ",".join(str(code) for code in (timing.get("api_statuses") or []))
+                job["log"].append(f"[perf] {asin}：API {len(api_ms)} 页 / {sum(api_ms) / 1000:.1f}s "
+                                  f"(HTTP {statuses or '?'})，调试落盘 {timing.get('debug_write_ms', 0) / 1000:.1f}s，"
+                                  f"本地入库 {save_ms / 1000:.1f}s")
                 job["done"] = i
                 await asyncio.sleep(1)
                 continue
@@ -1715,18 +1806,21 @@ async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: i
         gs = sorted(gs, key=lambda g: -sum((h.get("keywordsCount") or 0)
                                            for h in (g.get("history") or [])))[:top_groups]
         targets.append((asin, gs))
-    # 预计"组×周"总调用数：每组取 min(活跃周数, 周预算)，与收割循环的实际周数口径一致
+    # 组×周任务数：每组取 min(活跃周数, 周预算)；每个任务最多再分页请求两次。
     # （此前误按组数估算，units 却按周递增，导致进度 >100%）
     est_units = sum(min(len([h for h in (g.get("history") or [])
                             if (h.get("keywordsCount") or 0) > 0]), weeks_budget)
                     for _, gs in targets for g in gs)
+    max_keyword_pages = est_units * 2   # 每个组周最多取两页关键词
     job["plan"] = {"asins": len(ranked), "groups": sum(len(t[1]) for t in targets),
-                   "weeks_budget": weeks_budget, "est_calls": est_units}
+                   "weeks_budget": weeks_budget, "est_week_jobs": est_units,
+                   "max_keyword_pages": max_keyword_pages,
+                   "est_calls": max_keyword_pages}  # 兼容旧版界面字段
     job["phase"] = "B·关键词收割"
     job["units"], job["pct"] = 0, 10
     job["log"].append(f"[i] 阶段B：{len(targets)} 个 ASIN / {sum(len(t[1]) for t in targets)} 个组"
                       f"（按投放热度取前 {top_groups}），周预算 {weeks_budget} + 边际停止规则"
-                      f"，预计 ≤ {est_units} 次调用")
+                      f"；{est_units} 个组周任务，关键词分页请求最多约 {max_keyword_pages} 页")
 
     async def kw_fetch(asin, ad_id, b, e):
         """账号熔断切换：主账号失败→VIP；主账号会话失效→拉黑主账号改用 VIP；
@@ -1738,17 +1832,29 @@ async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: i
             attempts.append("vip")
         last_err = None
         for who in attempts:
+            timing = {}
             try:
                 rows = await adv.fetch_group_keywords(page_main if who == "main" else page_vip,
-                                                      ad_id, b, e, max_pages=2, asin=asin)
+                                                      ad_id, b, e, max_pages=2, asin=asin,
+                                                      metrics=timing)
                 kw_page_choice[who] += 1
-                return rows, who
+                return rows, who, timing
             except adv.SessionExpired as e1:
+                api_ms = timing.get("api_ms") or []
+                if api_ms:
+                    statuses = ",".join(str(code) for code in timing.get("api_statuses", []))
+                    job["log"].append(f"[perf] {who}关键词失败请求：{len(api_ms)}页 / {sum(api_ms) / 1000:.1f}s "
+                                      f"(HTTP {statuses or '?'})")
                 dead[who] = True
                 last_err = e1
                 job["log"].append(f"[!] {who}号 会话失效，拉黑该账号"
                                   f"（剩余可用: {', '.join(a for a in ('main', 'vip') if not dead[a]) or '无'}）")
             except Exception as e1:
+                api_ms = timing.get("api_ms") or []
+                if api_ms:
+                    statuses = ",".join(str(code) for code in timing.get("api_statuses", []))
+                    job["log"].append(f"[perf] {who}关键词请求异常：{len(api_ms)}页 / {sum(api_ms) / 1000:.1f}s "
+                                      f"(HTTP {statuses or '?'})")
                 last_err = e1
                 if who == "main" and vip_alive and not dead["vip"]:
                     continue   # 主账号其他错误 → 回退 VIP
@@ -1770,7 +1876,7 @@ async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: i
                 job["units"] += 1
                 job["pct"] = min(100, 10 + round(90 * job["units"] / max(est_units, 1)))
                 try:
-                    rows, used = await kw_fetch(asin, g["adId"], w["beginDate"], w["endDate"])
+                    rows, used, timing = await kw_fetch(asin, g["adId"], w["beginDate"], w["endDate"])
                 except adv.SessionExpired as e:
                     job["log"].append(f"[x] {e} —— 中止；已收割数据已入库")
                     job["log"].append(f"[i] 关键词账号使用统计: 主账号×{kw_page_choice['main']} "
@@ -1788,8 +1894,11 @@ async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: i
                     seen.setdefault(str(k.get("id") or k.get("keyword")), k)
                 gain = len(seen) - prev_n
                 prev_n = len(seen)
+                api_ms = timing.get("api_ms") or []
+                api_statuses = ",".join(str(code) for code in (timing.get("api_statuses") or []))
                 job["log"].append(f"    [{ai_}/{len(targets)}] 组{gi} 周{wi}/{len(weeks)} "
-                                  f"（{w.get('keywordsCount')}词/周，{used}号，实取{len(rows)}）"
+                                  f"（{w.get('keywordsCount')}词/周，{used}号，API {len(api_ms)}页/"
+                                  f"{sum(api_ms) / 1000:.1f}s HTTP {api_statuses or '?'}，实取{len(rows)}）"
                                   f" 取Top10 累计 {len(seen)}（新增 {gain}）"
                                   f" Top3: {' / '.join(new_words[:3])}")
                 # 边际收益停止：本周新增 < max(1, 累计10%) 时放弃剩余周
@@ -1810,6 +1919,20 @@ async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: i
     job["log"].append("[i] 广告词已入 ads_kw_full 表，可直接生成广告报告")
     job["pct"], job["detail"] = 100, "完成"
     job["status"] = "done"
+
+
+async def run_ads_auto(job_id: str, limit: int, top_groups: int, weeks_budget: int):
+    """所有未处理异常都必须结束任务，避免前端永远显示 running。"""
+    job = S["jobs"][job_id]
+    try:
+        await _run_ads_auto_impl(job_id, limit, top_groups, weeks_budget)
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"[:500]
+        job["status"] = "error"
+        job["phase"] = "任务失败"
+        job["detail"] = message
+        job["log"].append(f"[x] 自动抓取中断：{message}")
+
 
 @app.post("/api/ads/auto")
 async def ads_auto(req: dict):
@@ -2081,23 +2204,178 @@ async def amazon_save_watch(req: dict):
     return _amazon_watch_payload(group["id"])
 
 
-@app.post("/api/amazon/run")
-async def amazon_run(req: dict):  # 要求 JSON 请求，拒绝外站普通表单触发本地浏览器
+async def _run_amazon_job(asins, job):
+    try:
+        await amz.run_patrol(asins, job)
+    except asyncio.CancelledError:
+        job["status"] = "error"
+        job["detail"] = "服务关闭时巡查被安全中断；浏览器资源已清理。"
+        if job.get("job_source") == "schedule" and job.get("schedule_date"):
+            if AMZ_SCHEDULER is not None:
+                AMZ_SCHEDULER.finish(job["group_id"], job["schedule_date"], "error", job["detail"], job.get("job_id"))
+            else:
+                local_db.amz_schedule_run(job["group_id"], job["schedule_date"], "error", job["detail"], job.get("job_id"))
+        raise
+    if job.get("job_source") == "schedule" and job.get("schedule_date"):
+        detail = str(job.get("detail") or "")
+        blocked = job.get("status") == "error" and any(token in detail.casefold() for token in ("captcha", "验证码", "访问受限", "403", "429", "限制"))
+        status = "paused" if blocked else "done" if job.get("status") == "done" else "error"
+        message = ("遇到验证码/限流或访问限制，自动调度已暂停；请人工检查并重新启用。" if blocked
+                   else detail[:500] or "定时巡查完成。")
+        if AMZ_SCHEDULER is not None:
+            AMZ_SCHEDULER.finish(job["group_id"], job["schedule_date"], status, message, job.get("job_id"))
+        elif blocked:
+            current = local_db.amz_get_schedule(job["group_id"])
+            local_db.amz_save_schedule(job["group_id"], False, current["local_time"])
+            local_db.amz_schedule_run(job["group_id"], job["schedule_date"], status, message, job.get("job_id"))
+        else:
+            local_db.amz_schedule_run(job["group_id"], job["schedule_date"], status, message, job.get("job_id"))
+
+
+async def _start_amazon_job(group_id: int, source: str = "manual", include_own: bool = True) -> str:
     if _amazon_running_job():
-        raise HTTPException(409, "已有 Amazon 巡查进行中")
-    group = _amazon_group(req.get("group_id"))
+        raise RuntimeError("已有 Amazon 巡查进行中")
+    group = _amazon_group(group_id)
     asins = [item["asin"] for item in local_db.amz_watchlist(group["id"])]
+    if len(asins) > amz.MAX_ASINS:
+        raise RuntimeError("当前组竞品 ASIN 已超过 20 个上限，请先整理名单")
+    if include_own:
+        product = local_db.amz_get_product(group["id"])
+        if product["price_source"] == "observed" and product.get("asin") and product["asin"] not in asins:
+            if len(asins) >= amz.MAX_ASINS:
+                raise RuntimeError("本品采集将使本组总量超过 20 个 ASIN 安全上限，请先移除一个竞品")
+            asins.append(product["asin"])
     if not asins:
-        raise HTTPException(400, "请先在当前分组保存 Amazon 巡查名单")
+        message = "请先在当前分组添加至少一个竞品 ASIN" if not include_own else "请先在当前分组保存至少一个竞品 ASIN 或配置可采集的本品 ASIN"
+        raise RuntimeError(message)
     job_id = f"amzprice{time.time_ns()}"
+    schedule_date = None
+    if source == "schedule":
+        schedule_date = datetime.now(amazon_scheduler.SHANGHAI).date().isoformat()
     job = {"status": "running", "log": [], "done": 0, "total": len(asins),
            "rows": 0, "type": "amazon_price", "changed": 0, "baselines": 0,
            "unchanged": 0, "failed": 0, "results": [], "detail": "打开独立 Amazon 浏览器…",
-           "group_id": group["id"], "group_name": group["name"]}
+           "group_id": group["id"], "group_name": group["name"], "job_id": job_id,
+           "job_source": source, "schedule_date": schedule_date}
     S["jobs"][job_id] = job
     S["amazon_job_id"] = job_id
-    asyncio.create_task(amz.run_patrol(asins, job))
+    task = asyncio.create_task(_run_amazon_job(asins, job))
+    AMZ_TASKS.add(task)
+    task.add_done_callback(AMZ_TASKS.discard)
+    return job_id
+
+
+@app.post("/api/amazon/run")
+async def amazon_run(req: dict):  # JSON only; explicit user click starts browser collection.
+    if _amazon_running_job():
+        raise HTTPException(409, "已有 Amazon 巡查进行中")
+    if set(req) - {"group_id", "simple_mode"} or ("group_id" in req and type(req.get("group_id")) is not int):
+        raise HTTPException(400, "group_id 必须是正整数")
+    simple_mode = req.get("simple_mode", False)
+    if type(simple_mode) is not bool:
+        raise HTTPException(400, "simple_mode 须为布尔值")
+    group = _amazon_group(req.get("group_id"))
+    try:
+        job_id = await _start_amazon_job(group["id"], "manual", include_own=not simple_mode)
+    except RuntimeError as exc:
+        raise HTTPException(409 if "进行中" in str(exc) else 400, str(exc))
     return {"job_id": job_id, "group_id": group["id"], "group_name": group["name"]}
+
+
+def _amazon_all_groups_plan() -> dict:
+    all_groups = local_db.amz_groups()
+    groups = []
+    membership_count = 0
+    unique_asins = []
+    seen = set()
+    signature_rows = []
+    for group in all_groups:
+        try:
+            asins = amz.parse_asins([str(item.get("asin") or "")
+                                     for item in local_db.amz_watchlist(group["id"])])
+        except ValueError as exc:
+            raise HTTPException(409, f"分组“{group['name']}”中的 ASIN 名单无效：{exc}") from exc
+        signature_rows.append([group["id"], group["name"], asins])
+        membership_count += len(asins)
+        if asins:
+            groups.append({"id": group["id"], "name": group["name"], "count": len(asins)})
+        for asin in asins:
+            if asin not in seen:
+                seen.add(asin)
+                unique_asins.append(asin)
+    signature = hashlib.sha256(json.dumps(signature_rows, ensure_ascii=False, separators=(",", ":"))
+                               .encode("utf-8")).hexdigest()
+    return {"groups": groups, "saved_group_count": len(all_groups), "group_count": len(groups),
+            "empty_group_count": len(all_groups) - len(groups), "membership_count": membership_count,
+            "unique_asins": unique_asins, "unique_asin_count": len(unique_asins),
+            "duplicates_skipped": membership_count - len(unique_asins), "plan_hash": signature}
+
+
+@app.get("/api/amazon/run-all/preview")
+async def amazon_run_all_preview():
+    if _amazon_running_job():
+        raise HTTPException(409, "已有 Amazon 巡查进行中")
+    plan = await asyncio.to_thread(_amazon_all_groups_plan)
+    return {key: value for key, value in plan.items() if key != "unique_asins"} | {
+        "group_names": [group["name"] for group in plan["groups"]],
+        "limit": AMZ_BULK_MAX_UNIQUE_ASINS,
+        "can_run": bool(plan["unique_asin_count"]) and plan["unique_asin_count"] <= AMZ_BULK_MAX_UNIQUE_ASINS,
+    }
+
+
+async def _run_amazon_all_groups_job(asins: list[str], job: dict):
+    job["log"].append(
+        f"[i] 全部分组已合并：{job['group_count']} 个有名单分组，{job['membership_count']} 个名单条目，"
+        f"{len(asins)} 个唯一 ASIN；跨组重复只查询一次。"
+    )
+    try:
+        await amz.run_patrol(asins, job)
+        if job.get("status") == "done":
+            job["detail"] = (f"全部分组巡查完成：{job['group_count']} 个分组，"
+                             f"{job['unique_asin_count']} 个唯一 ASIN。")
+    except asyncio.CancelledError:
+        job["status"] = "error"
+        job["detail"] = "全部分组巡查因服务关闭而中断；已访问结果已保存。"
+        raise
+    except Exception as exc:
+        job["status"] = "error"
+        job["detail"] = str(exc)[:500]
+        job["log"].append(f"[x] 全部分组巡查失败：{type(exc).__name__}: {exc}")
+    finally:
+        if job.get("status") == "running":
+            job["status"] = "error"
+            job["detail"] = "批量巡查被中断，可人工重新运行。"
+
+
+@app.post("/api/amazon/run-all")
+async def amazon_run_all(req: dict):
+    if set(req) != {"confirm", "plan_hash"} or req.get("confirm") is not True or not isinstance(req.get("plan_hash"), str):
+        raise HTTPException(400, "必须明确确认 confirm=true 并提交当前预览 plan_hash")
+    if _amazon_running_job():
+        raise HTTPException(409, "已有 Amazon 巡查进行中")
+    plan = await asyncio.to_thread(_amazon_all_groups_plan)
+    if req["plan_hash"] != plan["plan_hash"]:
+        raise HTTPException(409, "分组名单在预览后有变化；请刷新预览后再确认")
+    if not plan["unique_asins"]:
+        raise HTTPException(400, "所有分组的 ASIN 名单均为空")
+    if plan["unique_asin_count"] > AMZ_BULK_MAX_UNIQUE_ASINS:
+        raise HTTPException(413, f"一键巡查最多支持 {AMZ_BULK_MAX_UNIQUE_ASINS} 个唯一 ASIN")
+    job_id = f"amzall{time.time_ns()}"
+    group_names = [group["name"] for group in plan["groups"]]
+    job = {"status": "running", "log": [], "done": 0, "total": plan["unique_asin_count"],
+           "rows": 0, "type": "amazon_price", "job_type": "all_groups", "changed": 0,
+           "baselines": 0, "unchanged": 0, "failed": 0, "results": [], "detail": "准备全部竞品组…",
+           "job_id": job_id, "job_source": "manual", "group_id": None, "group_name": "全部竞品组", "group_count": plan["group_count"],
+           "group_names": group_names, "membership_count": plan["membership_count"],
+           "unique_asin_count": plan["unique_asin_count"], "duplicates_skipped": plan["duplicates_skipped"]}
+    S["jobs"][job_id] = job
+    S["amazon_job_id"] = job_id
+    task = asyncio.create_task(_run_amazon_all_groups_job(plan["unique_asins"], job))
+    AMZ_TASKS.add(task)
+    task.add_done_callback(AMZ_TASKS.discard)
+    return {"job_id": job_id, "job_type": "all_groups", "group_count": plan["group_count"],
+            "membership_count": plan["membership_count"], "unique_asin_count": plan["unique_asin_count"],
+            "duplicates_skipped": plan["duplicates_skipped"]}
 
 
 @app.get("/api/amazon/changes")
@@ -2109,11 +2387,386 @@ async def amazon_changes(asin: str = "", limit: int = 100, group_id: int | None 
     return {"items": local_db.amz_changes(asin or None, limit, group_id=group["id"] if group else None)}
 
 
-# ---------- 17TRACK 人工查询结果导入（不自动访问第三方网站） ----------
+def _validated_price(value, field):
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise HTTPException(400, f"{field} 须为正数 USD 金额")
+    try:
+        amount = amazon_comparison._money(value)
+    except Exception:
+        amount = None
+    if amount is None or amount > 1000000 or len(str(value)) > 30:
+        raise HTTPException(400, f"{field} 须为 0–1,000,000 的有效正数")
+    return str(amount.quantize(amazon_comparison.CENT))
+
+
+@app.get("/api/amazon/product")
+async def amazon_product(group_id: int | None = None):
+    group = _amazon_group(group_id)
+    return {"product": local_db.amz_get_product(group["id"]), "group_id": group["id"]}
+
+
+@app.post("/api/amazon/product")
+async def amazon_save_product(req: dict):
+    if set(req) - {"group_id", "name", "asin", "spec_notes", "manual_price", "protected_floor", "currency", "price_source"}:
+        raise HTTPException(400, "本品配置含未知字段")
+    group = _amazon_group(req.get("group_id"))
+    name = req.get("name", "")
+    spec = req.get("spec_notes", "")
+    asin = req.get("asin")
+    currency = req.get("currency", "USD")
+    source = req.get("price_source", "manual")
+    if not isinstance(name, str) or len(name.strip()) > 120 or not isinstance(spec, str) or len(spec) > 2000:
+        raise HTTPException(400, "本品名称最多 120 字，规格备注最多 2000 字")
+    if asin in (None, ""):
+        asin = None
+    elif not isinstance(asin, str) or not amz.ASIN_RE.fullmatch(asin.strip().upper()):
+        raise HTTPException(400, "本品 ASIN 须为 10 位字母数字")
+    else:
+        asin = asin.strip().upper()
+    if currency != "USD":
+        raise HTTPException(400, "当前 Amazon US 采集固定 USD；不支持混币种")
+    if source not in {"manual", "observed"}:
+        raise HTTPException(400, "price_source 须为 manual 或 observed")
+    manual_price = _validated_price(req.get("manual_price"), "manual_price")
+    floor = _validated_price(req.get("protected_floor"), "protected_floor")
+    if source == "observed" and not asin:
+        raise HTTPException(400, "选择采集本品价格时必须提供 ASIN")
+    product = {"name": name.strip(), "asin": asin, "spec_notes": spec.strip(),
+               "manual_price": manual_price, "protected_floor": floor,
+               "currency": currency, "price_source": source}
+    try:
+        return {"product": local_db.amz_save_product(group["id"], product)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+def _amz_timestamp(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=AMZ_SHANGHAI)
+        return parsed.astimezone(AMZ_SHANGHAI)
+    except (TypeError, ValueError):
+        return None
+
+
+def _amz_simple_decimal(value):
+    try:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount <= 0 or amount > Decimal("1000000"):
+            return None
+        return amount.quantize(Decimal("0.01"))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _amz_simple_offer_read_today(current, successful_today):
+    if not successful_today or current.get("offer_read_status") not in {"observed", "read_no_explicit_offer"}:
+        return False
+    observed = _amz_timestamp(current.get("offer_observed_at"))
+    return observed is not None and observed.date() == datetime.now(AMZ_SHANGHAI).date()
+
+
+def _amz_simple_offer(current, successful_today):
+    if not successful_today:
+        return "—"
+    if not _amz_simple_offer_read_today(current, successful_today):
+        return "本次优惠未读取"
+    status = current.get("offer_read_status")
+    if status == "read_no_explicit_offer":
+        return "今日未发现明确优惠"
+    if status != "observed":
+        return "优惠状态待确认"
+    visible_types = {"coupon", "promotion", "lightning_deal", "limited_time_deal", "prime_exclusive"}
+    details = []
+    for entry in current.get("offer_evidence", []) if isinstance(current.get("offer_evidence"), list) else []:
+        if not isinstance(entry, dict) or entry.get("type") not in visible_types:
+            continue
+        text = str(entry.get("text") or "").strip()
+        if text and text not in details:
+            details.append(text)
+    return "；".join(details) if details else "今日未发现明确优惠"
+
+
+@app.get("/api/amazon/simple")
+async def amazon_simple_state(group_id: int | None = None):
+    """Minimal page payload: competitor members and today's checks only."""
+    group = _amazon_group(group_id)
+    product = local_db.amz_get_product(group["id"])
+    own_price = _amz_simple_decimal(product.get("manual_price")) if product.get("currency") == "USD" else None
+    today = datetime.now(AMZ_SHANGHAI).date()
+    competitors = local_db.amz_watchlist(group["id"])
+    items = []
+    for item in competitors:
+        current = item.get("current") if isinstance(item.get("current"), dict) else {}
+        checked = _amz_timestamp(item.get("last_checked"))
+        checked_today = checked is not None and checked.date() == today
+        last_status = str(item.get("last_status") or "")
+        availability = current.get("availability")
+        currency = str(current.get("currency") or "")
+        amount = _amz_simple_decimal(current.get("price"))
+        successful_today = checked_today and last_status in {"baseline", "changed", "unchanged"}
+        status = "今天未巡查"
+        shown_price = "—"
+        comparison = "未设本品价" if own_price is None else "—"
+        below = False
+        if checked_today and last_status == "error":
+            status = "采集失败"
+        elif checked_today and not successful_today:
+            status = "今日状态未确认"
+        elif successful_today and availability in {"out_of_stock", "unavailable"}:
+            status = "今日缺货 / 不可购买"
+        elif successful_today and currency != "USD":
+            status = "非 USD，不比较" if currency else "币种未确认，不比较"
+            shown_price = f"{current.get('price') or '价格未读到'} {currency}".strip()
+        elif successful_today and amount is None:
+            status = "今日未读到购买价"
+        elif successful_today:
+            status = "今日已检查" if availability == "available" else "今日已检查（库存未确认）"
+            shown_price = f"${amount:.2f}"
+            if own_price is not None:
+                difference = (own_price - amount).copy_abs().quantize(Decimal("0.01"))
+                if amount < own_price:
+                    below, comparison = True, f"低于本品 ${difference:.2f}"
+                elif amount == own_price:
+                    comparison = "与本品相同"
+                else:
+                    comparison = f"高于本品 ${difference:.2f}"
+        if checked_today and last_status == "error":
+            comparison = "无法判断"
+        elif checked_today and not successful_today:
+            comparison = "无法判断"
+        elif successful_today and availability in {"out_of_stock", "unavailable"}:
+            comparison = "不比较（缺货）"
+        elif successful_today and currency != "USD":
+            comparison = "不比较（非 USD）" if currency else "不比较（币种未确认）"
+        timestamp = (checked.strftime("%m-%d %H:%M") if checked is not None else "—")
+        if checked is not None and not checked_today:
+            timestamp += " · 非今天"
+        if checked_today and last_status == "error":
+            offer = "采集失败，优惠未确认"
+        elif checked_today and not successful_today:
+            offer = "今日状态未确认"
+        elif successful_today and availability in {"out_of_stock", "unavailable"}:
+            offer = "缺货时优惠不可确认"
+        else:
+            offer = _amz_simple_offer(current, successful_today)
+        items.append({"asin": item.get("asin"), "title": str(current.get("title") or "")[:180],
+                      "price": shown_price if successful_today else "—",
+                      "offer": offer, "below_own_price": below,
+                      "comparison": comparison, "checked_at": timestamp,
+                      "status": status, "error": str(item.get("last_error") or "")[:240] if checked_today and last_status == "error" else ""})
+    running_id = _amazon_running_job()
+    running = S["jobs"].get(running_id, {}) if running_id else {}
+    return {"group_id": group["id"], "group_name": group["name"],
+            "asins": [item["asin"] for item in competitors],
+            "max_asins": amz.MAX_ASINS, "reference_price": str(own_price) if own_price is not None else "",
+            "items": items, "today": today.isoformat(), "running_job_id": running_id,
+            "running_group_id": running.get("group_id"), "running_status": running.get("status")}
+
+
+@app.post("/api/amazon/reference-price")
+async def amazon_save_reference_price(req: dict):
+    if set(req) != {"group_id", "price"} or type(req.get("group_id")) is not int:
+        raise HTTPException(400, "请求须包含正整数 group_id 和 price")
+    group = _amazon_group(req["group_id"])
+    price = _validated_price(req.get("price"), "price")
+    try:
+        product = local_db.amz_save_reference_price(group["id"], price)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"group_id": group["id"], "reference_price": product["manual_price"], "currency": "USD"}
+
+
+@app.get("/api/amazon/comparison")
+async def amazon_comparison_view(group_id: int | None = None):
+    group = _amazon_group(group_id)
+    return amazon_comparison.build_comparison(group["id"])
+
+
+@app.get("/api/amazon/observations")
+async def amazon_observations(group_id: int | None = None, asin: str = "", limit: int = 100, offset: int = 0):
+    if not 1 <= limit <= 200 or offset < 0:
+        raise HTTPException(400, "limit 须为 1–200，offset 须为非负整数")
+    asin = asin.strip().upper()
+    if asin and not amz.ASIN_RE.fullmatch(asin):
+        raise HTTPException(400, "ASIN 格式错误")
+    group = _amazon_group(group_id) if group_id is not None else None
+    return local_db.amz_observations(group["id"] if group else None, asin or None, limit, offset)
+
+
+def _analysis_input(snapshot):
+    product = snapshot["product"]
+    return {"group_id": snapshot["group_id"], "market": "US", "currency": "USD",
+            "observed_at": snapshot["generated_at"],
+            "own_product": {"asin": product.get("asin"), "price": product.get("price"),
+                            "price_source": product.get("price_source"), "eligible": product.get("eligible")},
+            "competitors": [{"asin": row["asin"], "price": row["price"], "currency": row["currency"],
+                             "available": row["availability"] == "available", "eligible": row["eligible"],
+                             "offer_types": row["offer_types"], "offer_evidence": row["offer_evidence"],
+                             "observed_at": row["last_checked"]} for row in snapshot["comparisons"]]}
+
+
+@app.get("/api/amazon/ai-status")
+async def amazon_ai_status():
+    return amazon_comparison.ai_configuration()
+
+
+@app.post("/api/amazon/analysis/context")
+async def amazon_analysis_context(req: dict):
+    if set(req) != {"group_id"} or type(req.get("group_id")) is not int:
+        raise HTTPException(400, "请求须仅包含正整数 group_id")
+    group = _amazon_group(req["group_id"])
+    return {"type": "seller-sprite-amazon-analysis-context", "context": _analysis_input(
+        amazon_comparison.build_comparison(group["id"]))}
+
+
+@app.post("/api/amazon/analysis")
+async def amazon_analysis(req: dict):
+    if set(req) - {"group_id", "mode"} or type(req.get("group_id")) is not int:
+        raise HTTPException(400, "请求须包含正整数 group_id 和可选 mode")
+    mode = req.get("mode", "rules")
+    if mode not in {"rules", "ai"}:
+        raise HTTPException(400, "mode 须为 rules 或 ai")
+    group = _amazon_group(req["group_id"])
+    snapshot = await asyncio.to_thread(amazon_comparison.build_comparison, group["id"])
+    context = _analysis_input(snapshot)
+    rule_output = {"recommendation": snapshot["advice"]["label"],
+                   "rationale": snapshot["advice"]["evidence"], "caveats": snapshot["limitations"],
+                   "action": snapshot["advice"]["action"]}
+    if mode == "rules":
+        saved = await asyncio.to_thread(local_db.amz_save_analysis, group["id"], "local-rule", "rule",
+                                        snapshot["generated_at"], context, rule_output)
+        return {"status": "done", "analysis": saved, "comparison": snapshot}
+    ai_result, ai_status = await amazon_comparison.analyze_with_ai(context)
+    if ai_result is None:
+        kind = "ai_error" if ai_status["enabled"] else "rule"
+        fallback = {**rule_output, "ai_status": ai_status["reason"]}
+        saved = await asyncio.to_thread(local_db.amz_save_analysis, group["id"],
+                                        ai_status.get("model") or "local-rule", kind,
+                                        snapshot["generated_at"], context, fallback)
+        return {"status": "ai_error" if ai_status["enabled"] else "ai_disabled",
+                "ai": ai_status, "analysis": saved, "comparison": snapshot,
+                "rule_fallback": rule_output}
+    output = {**ai_result, "type": "ai", "model": ai_status["model"],
+              "observation_time": snapshot["generated_at"], "generated_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+    saved = await asyncio.to_thread(local_db.amz_save_analysis, group["id"], ai_status["model"], "ai",
+                                    snapshot["generated_at"], context, output)
+    return {"status": "done", "ai": ai_status, "analysis": saved, "comparison": snapshot}
+
+
+@app.get("/api/amazon/analyses")
+async def amazon_analyses(group_id: int | None = None, limit: int = 20):
+    group = _amazon_group(group_id)
+    return {"items": local_db.amz_analyses(group["id"], limit)}
+
+
+@app.get("/api/amazon/schedule")
+async def amazon_schedule_get(group_id: int | None = None):
+    group = _amazon_group(group_id)
+    config = local_db.amz_get_schedule(group["id"])
+    today = datetime.now(amazon_scheduler.SHANGHAI).date().isoformat()
+    return {"schedule": config, "today": local_db.amz_schedule_run_for(group["id"], today),
+            "supported": amazon_scheduler.AmazonDailyScheduler.supported(os.environ.get("WEB_CONCURRENCY", "1")),
+            "scheduler_error": AMZ_SCHEDULER.last_error if AMZ_SCHEDULER is not None else "服务尚未启动，启用后将在现有服务进程中运行"}
+
+
+@app.post("/api/amazon/schedule")
+async def amazon_schedule_save(req: dict):
+    if set(req) != {"group_id", "enabled", "local_time", "timezone"}:
+        raise HTTPException(400, "请求须包含 group_id、enabled、local_time 和 timezone")
+    group = _amazon_group(req.get("group_id"))
+    if type(req.get("enabled")) is not bool:
+        raise HTTPException(400, "enabled 必须是布尔值")
+    local_time = req.get("local_time")
+    if not isinstance(local_time, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", local_time):
+        raise HTTPException(400, "local_time 须为 HH:MM")
+    if req.get("timezone") != "Asia/Shanghai":
+        raise HTTPException(400, "当前只支持明确时区 Asia/Shanghai")
+    if req["enabled"] and not amazon_scheduler.AmazonDailyScheduler.supported(os.environ.get("WEB_CONCURRENCY", "1")):
+        raise HTTPException(409, "多 worker 环境不支持每日调度；已拒绝启用")
+    if req["enabled"]:
+        items = local_db.amz_watchlist(group["id"])
+        product = local_db.amz_get_product(group["id"])
+        if not items and not (product["price_source"] == "observed" and product.get("asin")):
+            raise HTTPException(400, "请先保存至少一个竞品 ASIN 或可采集的本品 ASIN")
+    return {"schedule": local_db.amz_save_schedule(group["id"], req["enabled"], local_time),
+            "message": "默认关闭；启用后仅在本工作台进程运行时按北京时间执行。休眠/关闭不保证任务。"}
+
+
+@app.get("/api/amazon/schedule/runs")
+async def amazon_schedule_runs(group_id: int | None = None, limit: int = 100):
+    if not 1 <= limit <= 200:
+        raise HTTPException(400, "limit 须为 1–200")
+    runs = local_db.amz_schedule_runs(limit)
+    if group_id is not None:
+        group = _amazon_group(group_id)
+        runs = [item for item in runs if item["group_id"] == group["id"]]
+    return {"items": runs[:limit]}
+
+
+# ---------- Tracking import preview, local storage, and manual summary pasteback ----------
+
+_TRACKING_MAX_BODY = track_import.MAX_XLSX_BYTES
+
+
+def _tracking_preview(parsed: dict, include_sheets: bool = False) -> dict:
+    pairs = parsed.get("pairs", [])
+    errors = parsed.get("errors", [])
+    duplicates = set()
+    unique_orders = set()
+    unique_tracks = set()
+    carrier_hints = {}
+    for pair in pairs:
+        key = (pair["order_id"], pair["tracking_number"].casefold())
+        if key in duplicates:
+            continue
+        duplicates.add(key)
+        unique_orders.add(pair["order_id"])
+        unique_tracks.add(pair["tracking_number"].casefold())
+        suggestion = track_store.tracking_carrier.suggest_carrier(pair["tracking_number"])
+        carrier_hints.setdefault(pair["tracking_number"], suggestion)
+    unique_orders.update(error["order_id"] for error in errors if isinstance(error.get("order_id"), str) and error["order_id"])
+    try:
+        stored = track_store.preview_pairs(pairs)
+    except ValueError as exc:
+        stored = {"input_duplicates": 0, "database_duplicates": 0,
+                  "new_associations": 0, "stored_associations": 0,
+                  "capacity": track_store.MAX_ORDERS, "capacity_ok": False}
+        errors = [*errors, {"line": 0, "error": str(exc), "text": ""}]
+    result = {
+        "row_count": len(pairs) + len(errors), "valid_rows": len(pairs),
+        "invalid_rows": errors, "valid_associations": len(pairs),
+        "unique_associations": len(duplicates), "unique_orders": len(unique_orders),
+        "unique_tracking_numbers": len(unique_tracks), "input_duplicates": stored["input_duplicates"],
+        "database_duplicates": stored["database_duplicates"],
+        "new_associations": stored["new_associations"], "stored_associations": stored["stored_associations"],
+        "capacity": stored["capacity"], "capacity_ok": stored["capacity_ok"],
+        "pairs": pairs, "carrier_hints": carrier_hints,
+    }
+    if include_sheets:
+        result.update({"sheet_names": parsed.get("sheet_names", []), "sheet_name": parsed.get("sheet_name")})
+    return result
+
 
 @app.get("/api/tracking/orders")
-async def tracking_orders():
-    return {"items": track_store.list_orders(), "max_orders": track_store.MAX_ORDERS,
+async def tracking_orders(limit: int = 100, offset: int = 0, search: str = "", status: str = "",
+                         carrier: str = "", archived: bool = False):
+    if not 1 <= limit <= 200 or offset < 0:
+        raise HTTPException(400, "limit 须为 1–200，offset 须为非负整数")
+    if len(search) > 100 or status not in {"", "pending", "needs_update", "delivered", "in_transit", "out_for_delivery", "exception", "not_found", "awaiting_pickup", "unknown"}:
+        raise HTTPException(400, "搜索内容过长或状态筛选无效")
+    if carrier not in {"", "auto", "fedex", "usps"}:
+        raise HTTPException(400, "carrier 筛选无效")
+    return {"items": track_store.list_orders(limit=limit, offset=offset, search=search, status=status,
+                                             carrier=carrier, archived=archived),
+            "total": track_store.order_count(search=search, status=status, carrier=carrier,
+                                             archived=archived),
+            "limit": limit, "offset": offset, "max_orders": track_store.MAX_ORDERS,
             "batch_size": track_store.BATCH_SIZE}
 
 
@@ -2128,12 +2781,217 @@ async def tracking_add_orders(req: dict):
         raise HTTPException(400, str(exc))
 
 
+@app.post("/api/tracking/preview")
+async def tracking_preview(req: dict):
+    text = req.get("text")
+    if not isinstance(text, str):
+        raise HTTPException(400, "text 必须是粘贴的 TSV/CSV 文本")
+    if len(text.encode("utf-8")) > _TRACKING_MAX_BODY:
+        raise HTTPException(413, "导入文本超过 5 MiB 限制")
+    parsed = await asyncio.to_thread(track_import.parse_pairs, text)
+    return await asyncio.to_thread(_tracking_preview, parsed)
+
+
+@app.post("/api/tracking/import")
+async def tracking_import_pairs(req: dict):
+    text = req.get("text")
+    if not isinstance(text, str) or req.get("only_valid_rows") is not True:
+        raise HTTPException(400, "请提交文本并明确确认 only_valid_rows=true")
+    if len(text.encode("utf-8")) > _TRACKING_MAX_BODY:
+        raise HTTPException(413, "导入文本超过 5 MiB 限制")
+    parsed = await asyncio.to_thread(track_import.parse_pairs, text)
+    try:
+        result = track_store.add_pairs(parsed["pairs"])
+    except ValueError as exc:
+        status_code = 409 if "最多保存" in str(exc) or "上限" in str(exc) else 400
+        raise HTTPException(status_code, str(exc))
+    return {**result, "invalid_rows": parsed["errors"], "ignored_invalid_rows": len(parsed["errors"])}
+
+
+async def _read_limited_tracking_upload(request: Request) -> bytes:
+    chunks = []
+    total = 0
+    try:
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > _TRACKING_MAX_BODY:
+                raise HTTPException(413, "XLSX 文件超过 5 MiB 限制")
+            chunks.append(chunk)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"无法读取 XLSX 上传流：{type(exc).__name__}")
+    return b"".join(chunks)
+
+
+@app.post("/api/tracking/preview-xlsx")
+async def tracking_preview_xlsx(request: Request, sheet: str | None = None):
+    data = await _read_limited_tracking_upload(request)
+    parsed = await asyncio.to_thread(track_import.parse_xlsx, data, sheet)
+    return await asyncio.to_thread(_tracking_preview, parsed, True)
+
+
+@app.post("/api/tracking/import-xlsx")
+async def tracking_import_xlsx(request: Request, sheet: str | None = None, only_valid_rows: bool = False):
+    if not only_valid_rows:
+        raise HTTPException(400, "请明确确认 only_valid_rows=true")
+    data = await _read_limited_tracking_upload(request)
+    parsed = await asyncio.to_thread(track_import.parse_xlsx, data, sheet)
+    if not parsed["pairs"] and any(error.get("line") == 0 for error in parsed["errors"]):
+        raise HTTPException(400, parsed["errors"][0]["error"])
+    try:
+        result = track_store.add_pairs(parsed["pairs"])
+    except ValueError as exc:
+        status_code = 409 if "最多保存" in str(exc) or "上限" in str(exc) else 400
+        raise HTTPException(status_code, str(exc))
+    return {**result, "invalid_rows": parsed["errors"], "ignored_invalid_rows": len(parsed["errors"]),
+            "sheet_name": parsed.get("sheet_name")}
+
+
+@app.post("/api/tracking/orders/{order_row_id}/carrier")
+async def tracking_set_carrier(order_row_id: int, req: dict):
+    try:
+        changed = track_store.set_carrier(order_row_id, req.get("carrier"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not changed:
+        raise HTTPException(404, "订单追踪项不存在")
+    return {"updated": True}
+
+
+@app.get("/api/tracking/candidates")
+async def tracking_candidates(scope: str = "all"):
+    if scope not in {"pending", "all"}:
+        raise HTTPException(400, "scope 必须是 pending 或 all")
+    items = await asyncio.to_thread(track_store.pending_candidates, detailed=True,
+                                    unscanned_only=scope == "pending")
+    counts = {carrier: sum(item["carrier"] == carrier for item in items)
+              for carrier in ("fedex", "usps", "auto")}
+    return {"items": items, "counts": counts, "total": len(items), "batch_size": track_store.BATCH_SIZE,
+            "scope": scope}
+
+
 @app.get("/api/tracking/next-batch")
-async def tracking_next_batch(limit: int = 40):
-    if limit < 1 or limit > track_store.BATCH_SIZE:
-        raise HTTPException(400, f"limit 必须在 1–{track_store.BATCH_SIZE} 之间")
-    items = track_store.next_batch(limit=limit)
-    return {"items": items, "total": track_store.pending_count()}
+async def tracking_next_batch(limit: int = 40, detailed: bool = False, offset: int = 0):
+    if limit < 1 or limit > track_store.BATCH_SIZE or offset < 0:
+        raise HTTPException(400, f"limit 必须在 1–{track_store.BATCH_SIZE} 之间，offset 须为非负整数")
+    items = await asyncio.to_thread(track_store.next_batch, limit=limit, detailed=detailed, offset=offset)
+    total = await asyncio.to_thread(track_store.pending_count, carrier="fedex")
+    return {"items": items, "total": total, "offset": offset, "carrier": "fedex"}
+
+
+def _validate_usps_query_request(req: dict, max_numbers: int = usps_browser.MAX_USPS_QUERY_NUMBERS) -> list[str]:
+    if not isinstance(req, dict) or set(req) != {"tracking_numbers"}:
+        raise HTTPException(400, "仅接受 tracking_numbers；不允许发送订单号或其它字段")
+    numbers = req.get("tracking_numbers")
+    if not isinstance(numbers, list) or not numbers:
+        raise HTTPException(400, "tracking_numbers 必须是非空数组")
+    allowed = {str(item["tracking_number"]).casefold()
+               for item in track_store.pending_candidates(carrier="usps")}
+    unique: dict[str, str] = {}
+    for number in numbers:
+        if not isinstance(number, str) or not re.fullmatch(r"[A-Za-z0-9]{4,34}", number.strip()):
+            raise HTTPException(400, "USPS 跟踪号格式无效")
+        clean = number.strip()
+        key = clean.casefold()
+        if key not in allowed:
+            raise HTTPException(400, "本批包含非当前启用 USPS 待办中的号码；未启动查询")
+        unique.setdefault(key, clean)
+    if len(unique) > max_numbers:
+        raise HTTPException(400, f"每批最多 {max_numbers} 个唯一跟踪号")
+    return list(unique.values())
+
+
+@app.post("/api/tracking/usps/query/start")
+async def tracking_usps_query_start(req: dict):
+    numbers = _validate_usps_query_request(req)
+    if _tracking_browser_busy():
+        raise HTTPException(409, "已有物流网页查询会话；请等待完成或取消后再开始")
+    try:
+        return await USPS_QUERY.start(numbers)
+    except usps_browser.USPSQueryBusy as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except usps_browser.USPSQueryError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/tracking/usps/query/status")
+async def tracking_usps_query_status():
+    return USPS_QUERY.snapshot()
+
+
+@app.post("/api/tracking/usps/query/continue")
+async def tracking_usps_query_continue():
+    try:
+        return await USPS_QUERY.continue_reading()
+    except usps_browser.USPSQueryError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/tracking/usps/query/cancel")
+async def tracking_usps_query_cancel():
+    return await USPS_QUERY.cancel()
+
+
+def _tracking_browser_busy() -> bool:
+    active = {"opening", "submitted", "waiting_user", "collecting"}
+    return any(session.snapshot().get("status") in active for session in (USPS_QUERY, TRACK718_QUERY))
+
+
+@app.post("/api/tracking/track718/query/start")
+async def tracking_track718_query_start(req: dict):
+    numbers = _validate_usps_query_request(req, max_numbers=usps_browser.MAX_TRACK718_QUERY_NUMBERS)
+    if _tracking_browser_busy():
+        raise HTTPException(409, "已有物流网页查询会话；请等待完成或取消后再开始")
+    try:
+        return await TRACK718_QUERY.start(numbers)
+    except usps_browser.USPSQueryBusy as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except usps_browser.USPSQueryError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/tracking/track718/query/status")
+async def tracking_track718_query_status():
+    return TRACK718_QUERY.snapshot()
+
+
+@app.post("/api/tracking/track718/query/continue")
+async def tracking_track718_query_continue():
+    try:
+        return await TRACK718_QUERY.continue_reading()
+    except usps_browser.USPSQueryError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/tracking/track718/query/cancel")
+async def tracking_track718_query_cancel():
+    return await TRACK718_QUERY.cancel()
+
+
+@app.post("/api/tracking/track718/import-summary")
+async def tracking_track718_import_summary(req: dict):
+    if not isinstance(req, dict) or set(req) != {"text", "tracking_numbers"}:
+        raise HTTPException(400, "仅接受 text 和本批 tracking_numbers")
+    text = req.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(400, "请粘贴 Track718 结果页面文本")
+    numbers = _validate_usps_query_request({"tracking_numbers": req.get("tracking_numbers")},
+                                           max_numbers=usps_browser.MAX_TRACK718_QUERY_NUMBERS)
+    parsed = track_import.parse_track718_summary(text, numbers)
+    result = track_store.import_records(parsed["records"])
+    return {**result, "errors": parsed["errors"]}
+
+
+@app.get("/api/tracking/cleanup-preview")
+async def tracking_delivered_cleanup_preview():
+    return await asyncio.to_thread(track_store.delivered_cleanup_preview)
+
+
+@app.post("/api/tracking/clear-delivered")
+async def tracking_clear_delivered():
+    """Immediately clear complete all-delivered orders in one atomic transaction."""
+    return await asyncio.to_thread(track_store.clear_delivered_orders)
 
 
 @app.post("/api/tracking/import-summary")
@@ -2144,6 +3002,49 @@ async def tracking_import_summary(req: dict):
     parsed = track_import.parse_summary(text)
     result = track_store.import_records(parsed["records"])
     return {**result, "errors": parsed["errors"]}
+
+
+@app.post("/api/tracking/usps/import-summary")
+async def tracking_usps_import_summary(req: dict):
+    if not isinstance(req, dict) or set(req) != {"text", "tracking_numbers"}:
+        raise HTTPException(400, "仅接受 text 和本批 tracking_numbers")
+    text = req.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(400, "请粘贴 USPS 结果页面文本")
+    numbers = _validate_usps_query_request({"tracking_numbers": req.get("tracking_numbers")})
+    parsed = track_import.parse_usps_summary(text, numbers)
+    result = track_store.import_records(parsed["records"])
+    return {**result, "errors": parsed["errors"]}
+
+
+@app.post("/api/tracking/orders/{order_row_id}/note")
+async def tracking_set_order_note(order_row_id: int, req: dict):
+    if not isinstance(req, dict) or set(req) != {"note"}:
+        raise HTTPException(400, "仅接受 note 文本字段")
+    try:
+        return {"item": track_store.set_order_note(order_row_id, req["note"])}
+    except ValueError as exc:
+        raise HTTPException(404 if "不存在" in str(exc) else 400, str(exc)) from exc
+
+
+@app.post("/api/tracking/orders/{order_row_id}/archive")
+async def tracking_archive_order(order_row_id: int, req: dict):
+    if not isinstance(req, dict) or set(req) - {"note"}:
+        raise HTTPException(400, "仅接受可选 note 字段")
+    try:
+        return track_store.archive_order(order_row_id, req.get("note", ""))
+    except ValueError as exc:
+        code = 404 if "不存在" in str(exc) else 409 if "归档" in str(exc) else 400
+        raise HTTPException(code, str(exc)) from exc
+
+
+@app.post("/api/tracking/orders/{order_row_id}/restore")
+async def tracking_restore_order(order_row_id: int):
+    try:
+        return track_store.restore_order(order_row_id)
+    except ValueError as exc:
+        code = 404 if "不存在" in str(exc) else 409
+        raise HTTPException(code, str(exc)) from exc
 
 
 @app.post("/api/tracking/orders/{order_row_id}/enabled")
@@ -2236,6 +3137,56 @@ async def tracking_fedex_email_review(event_id: int, req: dict):
         raise HTTPException(409, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(503, f"复核/写回失败（{type(exc).__name__}）") from exc
+
+
+@app.post("/api/tracking/fedex-email/reviews/accept-all")
+async def tracking_fedex_email_accept_all(req: dict):
+    if set(req) != {"confirm"} or req.get("confirm") is not True:
+        raise HTTPException(400, "必须明确确认 confirm=true 才能批量接受")
+    settings = _tracking_feta_settings()
+    try:
+        pending = await asyncio.to_thread(feta_repo.review_events, db_path=settings.db_path)
+    except Exception as exc:
+        raise HTTPException(503, f"无法读取 FETA 待复核事件（{type(exc).__name__}）") from exc
+    if len(pending) > 500:
+        raise HTTPException(413, "待复核事件超过 500 条安全上限；请分批复核")
+
+    result = {"total": len(pending), "accepted": 0, "status_updated": 0, "audit_only": 0,
+              "unmatched": 0, "skipped": 0, "finalize_failed": 0, "failed": 0}
+    for event in pending:
+        event_id = event["id"]
+        try:
+            await asyncio.to_thread(feta_repo.validate_review_event, event_id, "accept",
+                                    db_path=settings.db_path)
+            integration = await asyncio.to_thread(track_store.apply_feta_event, event)
+        except ValueError:
+            result["skipped"] += 1
+            continue
+        except Exception:
+            result["failed"] += 1
+            break  # database/runtime failure: stop rather than continue a partial bulk write
+        if not integration["matched"]:
+            result["unmatched"] += 1
+            continue
+        try:
+            await asyncio.to_thread(feta_service.review_event, event_id, "accept", settings)
+        except ValueError:
+            # Target DB write is keyed by FETA event ID; a retry is safe and will not duplicate it.
+            result["finalize_failed"] += 1
+            continue
+        except Exception:
+            result["failed"] += 1
+            break
+        result["accepted"] += 1
+        result["status_updated"] += int(integration.get("status_updated") or 0)
+        if integration.get("status") is None:
+            result["audit_only"] += 1
+    try:
+        remaining = await asyncio.to_thread(feta_repo.review_events, db_path=settings.db_path)
+        result["pending_after"] = len(remaining)
+    except Exception:
+        result["pending_after"] = None
+    return result
 
 
 # ---------- 页面 ----------

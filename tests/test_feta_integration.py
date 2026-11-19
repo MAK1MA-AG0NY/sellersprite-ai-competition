@@ -87,6 +87,33 @@ class FetaBridgeTests(unittest.IsolatedAsyncioTestCase):
         apply.assert_not_called()
         self.assertIsNone(web_server.track_store.list_orders()[0]["status"])
 
+    async def test_bulk_accept_requires_confirmation_and_keeps_unmatched_pending(self):
+        web_server.track_store.add_pairs([
+            {"order_id": "FETA-BULK-A", "tracking_number": "FETATEST601"},
+            {"order_id": "FETA-BULK-B", "tracking_number": "FETATEST602"},
+        ])
+        events = [
+            {"id": 61, "tracking_number": "FETATEST601", "received_at_utc": "2026-11-03T12:00:00Z",
+             "raw_status": "In transit", "normalized_status": "IN_TRANSIT", "raw_eta_text": None},
+            {"id": 62, "tracking_number": "FETATEST602", "received_at_utc": "2026-11-03T12:01:00Z",
+             "raw_status": "No result", "normalized_status": "UNKNOWN", "raw_eta_text": None},
+            {"id": 63, "tracking_number": "FETAMISSING603", "received_at_utc": "2026-11-03T12:02:00Z",
+             "raw_status": "Delivered", "normalized_status": "DELIVERED", "raw_eta_text": None},
+        ]
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as error:
+            await web_server.tracking_fedex_email_accept_all({"confirm": False})
+        self.assertEqual(error.exception.status_code, 400)
+        with patch.object(web_server.feta_config, "load_settings", return_value=self.settings), \
+             patch.object(web_server.feta_repo, "review_events", side_effect=[events, [events[2]]]), \
+             patch.object(web_server.feta_repo, "validate_review_event") as validate, \
+             patch.object(web_server.feta_service, "review_event", return_value={"review_state": "accepted"}) as review:
+            result = await web_server.tracking_fedex_email_accept_all({"confirm": True})
+        self.assertEqual((result["accepted"], result["unmatched"], result["pending_after"]), (2, 1, 1))
+        self.assertEqual((result["status_updated"], result["audit_only"]), (1, 1))
+        self.assertEqual(validate.call_count, 3)
+        self.assertEqual(review.call_count, 2)
+
     async def test_web_inbox_sync_is_explicit_and_mail_transport_is_mocked(self):
         result_value = {"processed": 1, "events_saved": 2}
         with patch.object(web_server.feta_config, "load_settings", return_value=self.settings), \

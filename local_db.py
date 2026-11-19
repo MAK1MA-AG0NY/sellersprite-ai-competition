@@ -351,7 +351,32 @@ def purge_foreign_ads():
 
 # ---------- Amazon US 手动巡查：当前有效值 + 仅变化历史 ----------
 
-AMZ_FIELDS = ("title", "price", "reference_price", "currency", "coupon", "promotions", "availability")
+AMZ_FIELDS = ("title", "price", "reference_price", "currency", "coupon", "promotions", "availability",
+              "offer_types", "offer_evidence")
+AMZ_CHECK_METADATA_FIELDS = ("offer_observed_at", "offer_read_status")
+
+
+def _amz_init_extended(c):
+    """Lazily initialize Amazon observations, own-product, analysis, and scheduler storage."""
+    with c:
+        c.execute("CREATE TABLE IF NOT EXISTS amz_observations ("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT, asin TEXT NOT NULL, observed_at TEXT NOT NULL, data TEXT NOT NULL)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_amz_observations_asin_time ON amz_observations(asin, observed_at DESC, id DESC)")
+        c.execute("CREATE TABLE IF NOT EXISTS amz_group_products ("
+                  "group_id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', asin TEXT, spec_notes TEXT NOT NULL DEFAULT '', "
+                  "manual_price TEXT, protected_floor TEXT, currency TEXT NOT NULL DEFAULT 'USD', "
+                  "price_source TEXT NOT NULL DEFAULT 'manual', updated_at TEXT NOT NULL)")
+        c.execute("CREATE TABLE IF NOT EXISTS amz_analyses ("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER NOT NULL, created_at TEXT NOT NULL, "
+                  "model TEXT NOT NULL, kind TEXT NOT NULL, observation_time TEXT NOT NULL, input_json TEXT NOT NULL, "
+                  "output_json TEXT NOT NULL, is_stale INTEGER NOT NULL DEFAULT 0)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_amz_analyses_group ON amz_analyses(group_id, id DESC)")
+        c.execute("CREATE TABLE IF NOT EXISTS amz_schedules ("
+                  "group_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, local_time TEXT NOT NULL DEFAULT '08:00', "
+                  "timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai', updated_at TEXT NOT NULL)")
+        c.execute("CREATE TABLE IF NOT EXISTS amz_schedule_runs ("
+                  "group_id INTEGER NOT NULL, run_date TEXT NOT NULL, status TEXT NOT NULL, message TEXT NOT NULL DEFAULT '', "
+                  "job_id TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(group_id, run_date))")
 
 
 def _amz_init_groups(c):
@@ -369,6 +394,7 @@ def _amz_init_groups(c):
         if created.rowcount:
             c.execute("INSERT INTO amz_group_asins(group_id, asin) "
                       "SELECT ?, asin FROM amz_watch WHERE enabled=1", (created.lastrowid,))
+    _amz_init_extended(c)
 
 
 def _amz_group(c, group_id=None):
@@ -484,6 +510,21 @@ def amz_watchlist(group_id=None):
         c.close()
 
 
+def amz_get_watch(asin):
+    if not asin:
+        return None
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        row = c.execute("SELECT current_data, last_checked, last_status, last_error FROM amz_watch WHERE asin=?", (asin,)).fetchone()
+        if not row:
+            return None
+        return {"asin": asin, "current": json.loads(row[0]), "last_checked": row[1],
+                "last_status": row[2], "last_error": row[3], "market": "US", "delivery_zip": "10001"}
+    finally:
+        c.close()
+
+
 def amz_save_watchlist(asins, group_id=None):
     """只替换当前组成员；跨组共用原基线/历史。ASIN 由调用方校验。"""
     asins = list(dict.fromkeys(asins))
@@ -507,27 +548,41 @@ def amz_save_watchlist(asins, group_id=None):
 def amz_record(asin, data, checked_at=None, note=""):
     """一次事务更新有效值与差异。None/缺失字段不覆盖；空串表示确认未展示。"""
     checked_at = checked_at or datetime.now().astimezone().isoformat(timespec="seconds")
-    patch = {k: data[k] for k in AMZ_FIELDS if k in data and data[k] is not None}
+    all_fields = AMZ_FIELDS + AMZ_CHECK_METADATA_FIELDS
+    patch = {k: data[k] for k in all_fields if k in data and data[k] is not None}
     if not patch:
         raise ValueError("本次没有可保存的有效字段")
     c = _conn()
     try:
+        _amz_init_extended(c)
         with c:
             row = c.execute("SELECT current_data FROM amz_watch WHERE asin=?", (asin,)).fetchone()
             if not row:
-                raise ValueError("ASIN 不在巡查名单中")
+                raise ValueError("ASIN 不在巡查名单中或未绑定为可采集本品")
             old = json.loads(row[0])
             changes = {k: {"old": old.get(k), "new": v}
-                       for k, v in patch.items() if old.get(k) != v} if old else {}
+                       for k, v in patch.items() if k in AMZ_FIELDS and old.get(k) != v} if old else {}
             status = "baseline" if not old else "changed" if changes else "unchanged"
+            merged = {**old, **patch}
             if changes:
                 c.execute("INSERT INTO amz_changes(asin, checked_at, changes) VALUES (?,?,?)",
                           (asin, checked_at, json.dumps(changes, ensure_ascii=False)))
-            if status != "unchanged":
+            # Success/check metadata advances even when the business observation is unchanged.
+            if merged != old:
                 c.execute("UPDATE amz_watch SET current_data=? WHERE asin=?",
-                          (json.dumps({**old, **patch}, ensure_ascii=False), asin))
+                          (json.dumps(merged, ensure_ascii=False), asin))
             c.execute("UPDATE amz_watch SET last_checked=?, last_status=?, last_error=? WHERE asin=?",
                       (checked_at, status, note[:500], asin))
+            snapshot = {key: merged.get(key) for key in (
+                "title", "price", "reference_price", "currency", "coupon", "promotions",
+                "availability", "offer_types", "offer_evidence", "offer_observed_at", "offer_read_status")}
+            snapshot.update({"market": "US", "delivery_zip": "10001", "check_status": status})
+            c.execute("INSERT INTO amz_observations(asin, observed_at, data) VALUES (?,?,?)",
+                      (asin, checked_at, json.dumps(snapshot, ensure_ascii=False)))
+            c.execute("UPDATE amz_analyses SET is_stale=1 WHERE group_id IN "
+                      "(SELECT group_id FROM amz_group_asins WHERE asin=? UNION "
+                      "SELECT group_id FROM amz_group_products WHERE asin=?) AND created_at<?",
+                      (asin, asin, checked_at))
         return {"asin": asin, "status": status, "changes": changes, "message": note}
     finally:
         c.close()
@@ -553,12 +608,206 @@ def amz_changes(asin=None, limit=100, group_id=None):
         if group_id is not None:
             _amz_init_groups(c)
             group = _amz_group(c, group_id)
-            filters.append("asin IN (SELECT asin FROM amz_group_asins WHERE group_id=?)")
-            args.append(group["id"])
+            filters.append("(asin IN (SELECT asin FROM amz_group_asins WHERE group_id=?) "
+                           "OR asin=(SELECT asin FROM amz_group_products WHERE group_id=?))")
+            args.extend([group["id"], group["id"]])
         where = " WHERE " + " AND ".join(filters) if filters else ""
         rows = c.execute("SELECT id, asin, checked_at, changes FROM amz_changes" + where +
                          " ORDER BY id DESC LIMIT ?", args + [max(1, min(int(limit), 200))]).fetchall()
         return [{"id": i, "asin": a, "checked_at": checked, "changes": json.loads(data)}
                 for i, a, checked, data in rows]
+    finally:
+        c.close()
+
+
+def amz_get_product(group_id):
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        group = _amz_group(c, group_id)
+        row = c.execute("SELECT name, asin, spec_notes, manual_price, protected_floor, currency, price_source, updated_at "
+                        "FROM amz_group_products WHERE group_id=?", (group["id"],)).fetchone()
+        if not row:
+            return {"group_id": group["id"], "name": "", "asin": None, "spec_notes": "",
+                    "manual_price": None, "protected_floor": None, "currency": "USD",
+                    "price_source": "manual", "updated_at": None}
+        return {"group_id": group["id"], "name": row[0], "asin": row[1], "spec_notes": row[2],
+                "manual_price": row[3], "protected_floor": row[4], "currency": row[5],
+                "price_source": row[6], "updated_at": row[7]}
+    finally:
+        c.close()
+
+
+def amz_save_product(group_id, product):
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        group = _amz_group(c, group_id)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with c:
+            if product.get("price_source", "manual") == "observed" and product.get("asin"):
+                # A bound own ASIN gets a shared observation row but is deliberately
+                # not inserted into amz_group_asins (the competitor membership table).
+                c.execute("INSERT INTO amz_watch(asin) VALUES (?) ON CONFLICT(asin) DO NOTHING", (product["asin"],))
+                _amz_sync_enabled(c)
+            c.execute("INSERT INTO amz_group_products(group_id, name, asin, spec_notes, manual_price, protected_floor, "
+                      "currency, price_source, updated_at) VALUES (?,?,?,?,?,?,?,?,?) "
+                      "ON CONFLICT(group_id) DO UPDATE SET name=excluded.name, asin=excluded.asin, "
+                      "spec_notes=excluded.spec_notes, manual_price=excluded.manual_price, "
+                      "protected_floor=excluded.protected_floor, currency=excluded.currency, "
+                      "price_source=excluded.price_source, updated_at=excluded.updated_at",
+                      (group["id"], product.get("name", ""), product.get("asin"), product.get("spec_notes", ""),
+                       product.get("manual_price"), product.get("protected_floor"), product.get("currency", "USD"),
+                       product.get("price_source", "manual"), now))
+        return amz_get_product(group["id"])
+    finally:
+        c.close()
+
+
+def amz_save_reference_price(group_id, manual_price):
+    """Update only the simple USD benchmark, preserving legacy product metadata."""
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        group = _amz_group(c, group_id)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with c:
+            existing = c.execute("SELECT 1 FROM amz_group_products WHERE group_id=?", (group["id"],)).fetchone()
+            if existing:
+                c.execute("UPDATE amz_group_products SET manual_price=?, currency='USD', updated_at=? WHERE group_id=?",
+                          (manual_price, now, group["id"]))
+            else:
+                c.execute("INSERT INTO amz_group_products(group_id,name,asin,spec_notes,manual_price,protected_floor,"
+                          "currency,price_source,updated_at) VALUES (?, '', NULL, '', ?, NULL, 'USD', 'manual', ?)",
+                          (group["id"], manual_price, now))
+        return amz_get_product(group["id"])
+    finally:
+        c.close()
+
+
+def amz_observations(group_id=None, asin=None, limit=100, offset=0):
+    c = _conn()
+    try:
+        _amz_init_extended(c)
+        args = []
+        filters = []
+        if asin:
+            filters.append("o.asin=?"); args.append(asin)
+        if group_id is not None:
+            _amz_init_groups(c)
+            group = _amz_group(c, group_id)
+            filters.append("(o.asin IN (SELECT asin FROM amz_group_asins WHERE group_id=?) "
+                           "OR o.asin=(SELECT asin FROM amz_group_products WHERE group_id=?))")
+            args.extend([group["id"], group["id"]])
+        where = " WHERE " + " AND ".join(filters) if filters else ""
+        total = c.execute("SELECT COUNT(*) FROM amz_observations o" + where, args).fetchone()[0]
+        rows = c.execute("SELECT o.id, o.asin, o.observed_at, o.data FROM amz_observations o" + where +
+                         " ORDER BY o.id DESC LIMIT ? OFFSET ?", args + [max(1, min(int(limit), 200)), max(0, int(offset))]).fetchall()
+        items = [{"id": row[0], "asin": row[1], "observed_at": row[2], "data": json.loads(row[3])} for row in rows]
+        return {"items": items, "total": total}
+    finally:
+        c.close()
+
+
+def amz_save_analysis(group_id, model, kind, observation_time, input_value, output_value):
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        group = _amz_group(c, group_id)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with c:
+            cursor = c.execute("INSERT INTO amz_analyses(group_id, created_at, model, kind, observation_time, input_json, output_json) "
+                               "VALUES (?,?,?,?,?,?,?)",
+                               (group["id"], now, str(model)[:100], str(kind)[:30], str(observation_time)[:100],
+                                json.dumps(input_value, ensure_ascii=False), json.dumps(output_value, ensure_ascii=False)))
+        return {"id": cursor.lastrowid, "group_id": group["id"], "created_at": now, "model": model,
+                "kind": kind, "observation_time": observation_time, "input": input_value,
+                "output": output_value, "is_stale": False}
+    finally:
+        c.close()
+
+
+def amz_analyses(group_id, limit=20):
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        group = _amz_group(c, group_id)
+        rows = c.execute("SELECT id, created_at, model, kind, observation_time, input_json, output_json, is_stale "
+                         "FROM amz_analyses WHERE group_id=? ORDER BY id DESC LIMIT ?",
+                         (group["id"], max(1, min(int(limit), 50)))).fetchall()
+        return [{"id": row[0], "created_at": row[1], "model": row[2], "kind": row[3],
+                 "observation_time": row[4], "input": json.loads(row[5]), "output": json.loads(row[6]),
+                 "is_stale": bool(row[7])} for row in rows]
+    finally:
+        c.close()
+
+
+def amz_get_schedule(group_id):
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        group = _amz_group(c, group_id)
+        row = c.execute("SELECT enabled, local_time, timezone, updated_at FROM amz_schedules WHERE group_id=?",
+                        (group["id"],)).fetchone()
+        if not row:
+            return {"group_id": group["id"], "enabled": False, "local_time": "08:00",
+                    "timezone": "Asia/Shanghai", "updated_at": None}
+        return {"group_id": group["id"], "enabled": bool(row[0]), "local_time": row[1],
+                "timezone": row[2], "updated_at": row[3]}
+    finally:
+        c.close()
+
+
+def amz_save_schedule(group_id, enabled, local_time):
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        group = _amz_group(c, group_id)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with c:
+            c.execute("INSERT INTO amz_schedules(group_id, enabled, local_time, timezone, updated_at) VALUES (?,?,?,?,?) "
+                      "ON CONFLICT(group_id) DO UPDATE SET enabled=excluded.enabled, local_time=excluded.local_time, "
+                      "timezone=excluded.timezone, updated_at=excluded.updated_at",
+                      (group["id"], int(bool(enabled)), local_time, "Asia/Shanghai", now))
+        return amz_get_schedule(group["id"])
+    finally:
+        c.close()
+
+
+def amz_schedule_run(group_id, run_date, status, message="", job_id=None):
+    c = _conn()
+    try:
+        _amz_init_groups(c)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with c:
+            c.execute("INSERT INTO amz_schedule_runs(group_id, run_date, status, message, job_id, updated_at) "
+                      "VALUES (?,?,?,?,?,?) ON CONFLICT(group_id, run_date) DO UPDATE SET status=excluded.status, "
+                      "message=excluded.message, job_id=excluded.job_id, updated_at=excluded.updated_at",
+                      (group_id, run_date, status, str(message)[:500], job_id, now))
+        return {"group_id": group_id, "run_date": run_date, "status": status, "message": str(message)[:500], "job_id": job_id}
+    finally:
+        c.close()
+
+
+def amz_schedule_run_for(group_id, run_date):
+    c = _conn()
+    try:
+        _amz_init_extended(c)
+        row = c.execute("SELECT status, message, job_id, updated_at FROM amz_schedule_runs WHERE group_id=? AND run_date=?",
+                        (group_id, run_date)).fetchone()
+        return None if not row else {"group_id": group_id, "run_date": run_date, "status": row[0],
+                                     "message": row[1], "job_id": row[2], "updated_at": row[3]}
+    finally:
+        c.close()
+
+
+def amz_schedule_runs(limit=100):
+    c = _conn()
+    try:
+        _amz_init_extended(c)
+        rows = c.execute("SELECT group_id, run_date, status, message, job_id, updated_at FROM amz_schedule_runs "
+                         "ORDER BY run_date DESC, group_id LIMIT ?", (max(1, min(int(limit), 200)),)).fetchall()
+        return [{"group_id": r[0], "run_date": r[1], "status": r[2], "message": r[3],
+                 "job_id": r[4], "updated_at": r[5]} for r in rows]
     finally:
         c.close()

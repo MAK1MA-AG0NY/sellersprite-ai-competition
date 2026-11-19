@@ -11,6 +11,9 @@ import local_db
 
 MAX_ASINS = 20
 US_ZIP = "10001"  # MVP 固定同一美国配送地区；不引入地区配置/账号系统。
+AMAZON_US_HOSTS = {"amazon.com", "www.amazon.com"}
+AMAZON_JP_BOOTSTRAP_HOSTS = {"amazon.co.jp", "www.amazon.co.jp"}
+AMAZON_CHALLENGE_RE = re.compile(r"robot check|enter the characters you see below|automated access to amazon", re.I)
 ASIN_RE = re.compile(r"[A-Z0-9]{10}")
 
 
@@ -146,12 +149,55 @@ EXTRACT_PRODUCT = r"""() => {
       '#priceblock_ourprice', '#priceblock_dealprice']),
     delivery_location: first(['#glow-ingress-block', '#nav-global-location-popover-link']),
     coupon_text: all(couponSelectors), promotions_text: all(promoSelectors),
+    offer_regions_seen: present([...couponSelectors, ...promoSelectors, '#corePriceDisplay_desktop_feature_div', '#corePrice_feature_div']),
     availability_text: first(['#availability', '#outOfStock', '#availabilityInsideBuyBox_feature_div']),
     captcha: visible(document.querySelector('#captchacharacters')),
     page_title: document.title,
     body_excerpt: (document.body?.innerText || '').slice(0, 14000)
   };
 }"""
+
+
+def classify_offers(raw, observed_at=None, price=None, reference_price=None):
+    """Classify only explicit visible deal evidence; generic discounts are not Lightning Deals."""
+    regions_seen = bool(raw.get("offer_regions_seen") or raw.get("coupon_region_seen") or raw.get("promo_region_seen"))
+    if not regions_seen:
+        return {"offer_types": ["unknown"], "offer_evidence": [],
+                "offer_read_status": "not_read", "offer_observed_at": None}
+    coupon = clean_text(raw.get("coupon_text"))
+    promotion = clean_text(raw.get("promotions_text"))
+    combined = " | ".join(value for value in (coupon, promotion) if value)
+    found: list[str] = []
+    evidence: list[dict[str, str]] = []
+
+    def add(kind, source, excerpt):
+        if kind not in found:
+            found.append(kind)
+            evidence.append({"type": kind, "source": source, "text": excerpt[:300]})
+
+    if re.search(r"\blightning\s+deal\b", combined, re.I):
+        add("lightning_deal", "coupon_or_promotion_region", combined)
+    if re.search(r"\blimited[- ]time\s+deal\b", combined, re.I):
+        add("limited_time_deal", "coupon_or_promotion_region", combined)
+    if re.search(r"\bprime\s+(?:exclusive|member[- ]exclusive)(?:\s+(?:deal|discount|offer))?", combined, re.I):
+        add("prime_exclusive", "coupon_or_promotion_region", combined)
+    if coupon and not re.search(r"\bno\s+coupons?\b", coupon, re.I):
+        add("coupon", "coupon_region", coupon)
+    if promotion and re.search(r"\bpromotion\b|\bbuy\s+.{1,80}\s+get\b|\bsave\s+\$", promotion, re.I):
+        add("promotion", "promotion_region", promotion)
+    try:
+        price_value = Decimal(str(price)) if price not in (None, "") else None
+        reference_value = Decimal(str(reference_price)) if reference_price not in (None, "") else None
+        if price_value is not None and reference_value is not None and reference_value > price_value:
+            add("reference_discount", "strikethrough_reference_price",
+                f"购买价 {price_value:.2f} USD < 划线参考价 {reference_value:.2f} USD；不构成秒杀证据")
+    except (InvalidOperation, ValueError):
+        pass
+    if not found:
+        found.append("unknown")
+    return {"offer_types": found, "offer_evidence": evidence,
+            "offer_read_status": "observed" if evidence else "read_no_explicit_offer",
+            "offer_observed_at": observed_at or __import__("datetime").datetime.now().astimezone().isoformat(timespec="seconds")}
 
 
 def normalize_observation(asin, raw, url):
@@ -183,6 +229,7 @@ def normalize_observation(asin, raw, url):
         raise ObservationError("未识别到明确的一次性美元购买价，也未确认缺货；保留原基线")
     data = {"title": clean_text(raw["title"])}
     notes = []
+    reference = None
     if price and state not in ("unavailable", "out_of_stock"):
         data.update(price=price, currency="USD")
         reference_text = clean_text(raw.get("reference_price_text"))
@@ -204,6 +251,15 @@ def normalize_observation(asin, raw, url):
             notes.append("/".join(unknown) + "未读取，保留上次有效值（不代表无优惠）")
     else:
         notes.append("缺货：页面明确提示暂时无货；保留金额为历史价，不代表当前可购买")
+    if state not in ("unavailable", "out_of_stock"):
+        offers = classify_offers(raw, price=price, reference_price=reference)
+        data["offer_read_status"] = offers["offer_read_status"]
+        if offers["offer_read_status"] != "not_read":
+            data["offer_types"] = offers["offer_types"]
+            data["offer_evidence"] = offers["offer_evidence"]
+            data["offer_observed_at"] = offers["offer_observed_at"]
+        else:
+            notes.append("优惠区域未读取；保留上次有效优惠，不能据此判断已取消")
     if state:
         data["availability"] = state
     return data, "；".join(notes)
@@ -221,6 +277,29 @@ async def _visible_first(page, selectors):
             except Exception:
                 continue
     return None
+
+
+LOCATION_ENTRY_SELECTORS = (
+    "#nav-global-location-popover-link", "#glow-ingress-block", "#nav-global-location-data-modal-action",
+    "[data-csa-c-slot-id='nav-global-location-slot']",
+    "button[aria-label*='delivery location' i]", "a[aria-label*='delivery location' i]",
+    "button[aria-label*='deliver to' i]", "a[aria-label*='deliver to' i]",
+    "button:has-text('Deliver to')", "a:has-text('Deliver to')", "[role='button']:has-text('Deliver to')",
+)
+
+
+async def _wait_for_location_entry(page, timeout_ms=25000):
+    """Wait through Amazon's delayed/202 homepage refresh for the visible location control."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000
+    while True:
+        candidate = await _visible_first(page, LOCATION_ENTRY_SELECTORS)
+        if candidate is not None:
+            return candidate
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return None
+        await page.wait_for_timeout(min(300, max(1, int(remaining * 1000))))
 
 
 ZIP_INPUT_SELECTORS = (
@@ -247,34 +326,120 @@ async def _wait_us_zip_input(page, timeout_ms):
 
 
 async def _confirmed_us_zip(page):
-    location = clean_text(await page.locator("#nav-global-location-popover-link").inner_text())
+    location_node = await _visible_first(page, LOCATION_ENTRY_SELECTORS)
+    if location_node is None:
+        return False
+    try:
+        location = clean_text(await location_node.inner_text(timeout=4000))
+    except Exception:
+        return False
     return bool(re.search(rf"(?<!\d){re.escape(US_ZIP)}(?!\d)", location))
 
 
-async def prepare_us_delivery(page):
-    """通过官网的公开配送弹窗固定美国邮编；若该匿名上下文已是目标邮编则复用。"""
-    response = await page.goto("https://www.amazon.com/", wait_until="domcontentloaded", timeout=45000)
+async def _wait_for_us_storefront(page, job):
+    hostname = (urlsplit(page.url).hostname or "").casefold()
+    if hostname in AMAZON_US_HOSTS:
+        return
+    if hostname not in AMAZON_JP_BOOTSTRAP_HOSTS:
+        raise ObservationError(f"Amazon US 初始化后落在非美国站点（{hostname or '未知'}），本轮未采集价格")
+    if not isinstance(job, dict) or job.get("job_source") != "manual":
+        raise AccessBlocked("JP 出口将 Amazon.com 重定向到 Amazon.co.jp；自动任务不会跨站采集")
+    job["detail"] = "JP 节点将 Amazon US 引到 Amazon.co.jp；请在打开的浏览器中切回 Amazon.com，之后会继续设置邮编 10001。"
+    job.setdefault("log", []).append("[i] 等待人工切回 Amazon.com；不会在日本站采集价格")
+    try:
+        await page.wait_for_function(
+            "hosts => hosts.includes((location.hostname || '').toLowerCase())",
+            arg=sorted(AMAZON_US_HOSTS), timeout=120000,
+        )
+    except Exception as exc:
+        raise ObservationError("等待切回 Amazon.com 超时；本轮未巡查商品。") from exc
+    if (urlsplit(page.url).hostname or "").casefold() not in AMAZON_US_HOSTS:
+        raise ObservationError("页面尚未回到 Amazon.com；本轮未采集价格")
+    job["log"].append("[+] 已回到 Amazon.com，继续设置美国配送邮编")
+
+
+async def _wait_for_manual_verification(page, job):
+    if not isinstance(job, dict) or job.get("job_source") != "manual":
+        raise AccessBlocked("Amazon 要求人工验证；定时巡查已停止，不会绕过验证")
+    job["detail"] = "Amazon 要求人工验证；请在打开的浏览器中完成验证，之后会继续选择邮编 10001。"
+    job.setdefault("log", []).append("[i] 等待人工完成 Amazon 验证；不会尝试绕过验证码")
+    try:
+        await page.wait_for_function("""() => {
+          const visible = el => !!el && el.getClientRects().length > 0 &&
+            getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+          const form = [...document.querySelectorAll('#captchacharacters, input[name*="captcha" i], iframe[src*="captcha" i]')].some(visible);
+          const text = `${document.title || ''} ${document.body?.innerText || ''}`;
+          return !form && !/robot check|enter the characters you see below|automated access to amazon/i.test(text);
+        }""", timeout=180000)
+    except Exception as exc:
+        raise AccessBlocked("等待人工 Amazon 验证超时；没有访问商品或更新价格") from exc
+    if (urlsplit(page.url).hostname or "").casefold() not in AMAZON_US_HOSTS:
+        await _wait_for_us_storefront(page, job)
+    title = await page.title()
+    try:
+        body = await page.locator("body").inner_text(timeout=4000)
+    except Exception:
+        body = ""
+    if AMAZON_CHALLENGE_RE.search(f"{title} {body}"):
+        raise AccessBlocked("Amazon 人工验证尚未完成；没有更新价格")
+    job["log"].append("[+] 人工验证已通过，继续选择美国配送邮编")
+
+
+async def _wait_for_manual_us_zip(page, job, reason):
+    if not isinstance(job, dict) or job.get("job_source") != "manual":
+        raise ObservationError(reason)
+    job["detail"] = f"{reason} 请在打开的浏览器中选择美国邮编 {US_ZIP}；确认后会自动继续。"
+    job.setdefault("log", []).append(f"[i] 等待人工将配送地址设为 ZIP {US_ZIP}，最多 2 分钟")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 120
+    while loop.time() < deadline:
+        if await _confirmed_us_zip(page):
+            break
+        await page.wait_for_timeout(400)
+    else:
+        raise ObservationError(f"人工选择邮编 {US_ZIP} 超时；本轮未更新商品价格。")
+    if (urlsplit(page.url).hostname or "").casefold() not in AMAZON_US_HOSTS:
+        raise ObservationError("人工选择后页面未停留在 Amazon.com；本轮未更新商品价格。")
+    if not await _confirmed_us_zip(page):
+        raise ObservationError(f"未能确认配送邮编 {US_ZIP}；本轮未更新商品价格。")
+    job["log"].append(f"[+] 已人工确认 Amazon.com 配送邮编 {US_ZIP}")
+
+
+async def prepare_us_delivery(page, job=None):
+    """固定美国配送邮编；地域跳转或界面变化时允许手动确认，不绕过验证码。"""
+    response = await page.goto("https://www.amazon.com/", wait_until="domcontentloaded", timeout=60000)
     if response and response.status in (403, 429, 503):
         raise AccessBlocked(f"Amazon HTTP {response.status}，未设置配送地区，本轮停止")
     if response and response.status >= 400:
         raise ObservationError(f"配送地区初始化失败：Amazon HTTP {response.status}")
-    body_text = ""
     try:
-        body_text = await page.locator("body").inner_text(timeout=5000)
-    except Exception:
-        pass
-    title = await page.title()
-    if await page.locator("#captchacharacters").count() or re.search(
-            r"robot check|enter the characters you see below|automated access to amazon", f"{title} {body_text}", re.I):
-        raise AccessBlocked("Amazon 出现验证码或访问限制，本轮停止；不自动绕过")
-    try:
-        # Amazon 可在同一配送弹窗中保留已选邮编，却隐藏 ZIP 输入框；先读位置，已符合时不再打开弹窗。
+        # JP 出口可能把 Amazon.com 落到日本站；只等待人工切回美国站，不在日本站采集。
+        await _wait_for_us_storefront(page, job)
+        body_text = ""
+        try:
+            body_text = await page.locator("body").inner_text(timeout=5000)
+        except Exception:
+            pass
+        title = await page.title()
+        captcha = await _visible_first(page, ("#captchacharacters", "input[name*='captcha' i]"))
+        if captcha is not None or AMAZON_CHALLENGE_RE.search(f"{title} {body_text}"):
+            await _wait_for_manual_verification(page, job)
+
+        # Amazon 可保留已选邮编却隐藏 ZIP 输入框；先读位置，已符合时不再打开弹窗。
         if await _confirmed_us_zip(page):
             return
-        await page.locator("#nav-global-location-popover-link").click(timeout=15000)
+        if isinstance(job, dict):
+            job["detail"] = "等待 Amazon 美国站加载配送位置控件…"
+        location_button = await _wait_for_location_entry(page, timeout_ms=25000)
+        if await _confirmed_us_zip(page):
+            return
+        if location_button is None:
+            await _wait_for_manual_us_zip(page, job, "Amazon 页面未显示配送位置入口。")
+            return
+        await location_button.click(timeout=15000)
 
-        # 先等待 GLUX 邮编框；部分地域版要先点提示条中的“Change Address”才加载地址控件。
-        zipcode = await _wait_us_zip_input(page, timeout_ms=2500)
+        # JP 节点/慢速页面会延迟挂载 GLUX 控件，先等候；部分地域版还需点 Change Address。
+        zipcode = await _wait_us_zip_input(page, timeout_ms=8000)
         if zipcode is None and not await _confirmed_us_zip(page):
             change_address = await _visible_first(page, (
                 ".glow-toaster-button-submit input[type='submit']",
@@ -283,19 +448,17 @@ async def prepare_us_delivery(page):
             ))
             if change_address is not None:
                 try:
-                    await change_address.click(timeout=5000)
+                    await change_address.click(timeout=7000)
                 except Exception:
-                    # Amazon a-button 的文本层可能被它自己的 submit input 覆盖；仅点击已定位的 Change Address 控件。
+                    # Amazon a-button 的文本层可能被 submit input 覆盖；只点击已定位的 Change Address 控件。
                     await change_address.evaluate("el => el.click()")
-                zipcode = await _wait_us_zip_input(page, timeout_ms=12000)
+                zipcode = await _wait_us_zip_input(page, timeout_ms=18000)
         if zipcode is None:
             if await _confirmed_us_zip(page):
                 return
-            raise ObservationError(
-                "Amazon 配送弹窗未显示可见的美国邮编输入框；若页面提示需要先点“Change Address”，"
-                "请稍后重试。当前页面位置："
-                f"{clean_text(await page.locator('#nav-global-location-popover-link').inner_text()) or '未知'}"
-            )
+            await _wait_for_manual_us_zip(page, job,
+                "Amazon 配送弹窗未显示可见的邮编输入框；请在页面中打开配送位置设置。")
+            return
 
         await zipcode.fill(US_ZIP, timeout=8000)
         apply = await _visible_first(page, (
@@ -306,19 +469,23 @@ async def prepare_us_delivery(page):
             ".a-popover-wrapper:visible input[type='submit']",
         ))
         if apply is None:
-            raise ObservationError("已填入邮编，但配送弹窗未显示可见的 Apply 按钮")
+            await _wait_for_manual_us_zip(page, job, "已填入邮编，但配送弹窗未显示 Apply 按钮。")
+            return
         await apply.click(timeout=10000)
 
-        # Apply 后的确认按钮会异步出现；等待 header 更新或可见确认控件，不能立即误判为缺失。
-        await page.wait_for_function(
-            "zip => [...document.querySelectorAll('#glow-ingress-block, #nav-global-location-popover-link')]"
-            ".some(el => el.innerText.includes(zip)) || "
-            "[...document.querySelectorAll('#GLUXConfirmClose, button[name=glowDoneButton]')]"
-            ".some(el => el.getClientRects().length && getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden')",
-            arg=US_ZIP, timeout=12000)
+        # Apply 后的确认控件会异步出现；优先自动确认，超时则保留浏览器给用户处理。
+        try:
+            await page.wait_for_function(
+                "zip => [...document.querySelectorAll('#glow-ingress-block, #nav-global-location-popover-link')]"
+                ".some(el => el.innerText.includes(zip)) || "
+                "[...document.querySelectorAll('#GLUXConfirmClose, button[name=glowDoneButton]')]"
+                ".some(el => el.getClientRects().length && getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden')",
+                arg=US_ZIP, timeout=15000)
+        except Exception:
+            await _wait_for_manual_us_zip(page, job, "Amazon 尚未确认配送邮编。")
+            return
         if not await _confirmed_us_zip(page):
             close = await _visible_first(page, (
-                # Amazon 用 a-button 覆盖文本按钮的 submit input 执行真实确认；优先点实际表单控件。
                 "input#GLUXConfirmClose[type='submit']",
                 "#GLUXConfirmClose:visible",
                 "input[name='glowDoneButton'][type='button']",
@@ -326,18 +493,16 @@ async def prepare_us_delivery(page):
                 ".a-popover-wrapper:visible button:has-text('Done')",
             ))
             if close is None:
-                raise ObservationError("邮编已提交，但 Amazon 未显示可见的确认按钮或更新位置")
+                await _wait_for_manual_us_zip(page, job, "邮编已提交，但 Amazon 未显示可见的确认按钮。")
+                return
             try:
-                await close.click(timeout=2500)
+                await close.click(timeout=4000)
             except Exception:
-                # Amazon 的 a-button 有时异步插入透明 submit input 覆盖“Done”文字按钮；
-                # 只在明确显示目标邮编的官方配送对话框内点击该确认控件。
                 clicked = await page.evaluate("""zip => {
                   const visible = el => !!el && el.getClientRects().length > 0 &&
                     getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
                   const body = document.body?.innerText || '';
                   if (!body.includes(zip) || !/You're now shopping for delivery to|selected location to show all products available for the United States/i.test(body)) return false;
-                  // Amazon 的 popover 包装层会随版本变化；邮编确认对话框已核验目标邮编后，只点精确的 GLUX 提交控件。
                   const submit = [...document.querySelectorAll('input#GLUXConfirmClose[type="submit"]')].find(visible);
                   const done = [...document.querySelectorAll('button[name="glowDoneButton"]')].find(visible);
                   const control = submit || done;
@@ -346,10 +511,14 @@ async def prepare_us_delivery(page):
                   return true;
                 }""", US_ZIP)
                 if not clicked and not await _confirmed_us_zip(page):
-                    raise ObservationError("美国邮编已提交，但配送确认按钮被遮挡或无法点击")
-        await page.wait_for_function(
-            "zip => [...document.querySelectorAll('#glow-ingress-block, #nav-global-location-popover-link')]"
-            ".some(el => el.innerText.includes(zip))", arg=US_ZIP, timeout=12000)
+                    await _wait_for_manual_us_zip(page, job, "邮编已提交，但确认按钮被遮挡或无法点击。")
+                    return
+        try:
+            await page.wait_for_function(
+                "zip => [...document.querySelectorAll('#glow-ingress-block, #nav-global-location-popover-link')]"
+                ".some(el => el.innerText.includes(zip))", arg=US_ZIP, timeout=15000)
+        except Exception:
+            await _wait_for_manual_us_zip(page, job, "等待配送位置更新超时。")
     except AccessBlocked:
         raise
     except Exception as exc:
@@ -360,6 +529,8 @@ async def prepare_us_delivery(page):
 
 async def collect_page(page, asin):
     response = await page.goto(product_url(asin), wait_until="domcontentloaded", timeout=45000)
+    if (urlsplit(page.url).hostname or "").casefold() not in AMAZON_US_HOSTS:
+        raise AccessBlocked("商品页离开 Amazon.com 美国站，停止采集以免记录日本站价格")
     if response and response.status in (403, 429, 503):
         raise AccessBlocked(f"Amazon HTTP {response.status}，本轮停止；稍后人工重试")
     if response and response.status >= 400:
@@ -390,11 +561,16 @@ async def run_patrol(asins, job):
                                                     accept_downloads=False)
                 page = await context.new_page()
 
+                allow_jp_bootstrap = [True]
+
                 async def restrict_navigation(route):
                     request = route.request
                     if request.is_navigation_request() and request.frame == page.main_frame:
                         u = urlsplit(request.url)
-                        if u.scheme != "https" or u.hostname not in ("www.amazon.com", "amazon.com"):
+                        host = (u.hostname or "").casefold()
+                        us_host = host in AMAZON_US_HOSTS
+                        jp_bootstrap = allow_jp_bootstrap[0] and host in AMAZON_JP_BOOTSTRAP_HOSTS
+                        if u.scheme != "https" or not (us_host or jp_bootstrap):
                             await route.abort()
                             return
                     await route.continue_()
@@ -402,7 +578,8 @@ async def run_patrol(asins, job):
                 await page.route("**/*", restrict_navigation)
                 job["detail"] = f"初始化美国配送邮编 {US_ZIP}…"
                 job["log"].append(f"[i] 固定匿名观察环境：Amazon US / 邮编 {US_ZIP}；不登录、不计算到手价")
-                await prepare_us_delivery(page)
+                await prepare_us_delivery(page, job)
+                allow_jp_bootstrap[0] = False
                 for i, asin in enumerate(asins, 1):
                     job["detail"] = f"{i}/{len(asins)} · {asin}"
                     job["log"].append(f"[i] 巡查 {asin}")

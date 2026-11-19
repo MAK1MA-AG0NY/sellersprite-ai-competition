@@ -151,7 +151,14 @@ async def dom_history(page):
     try:
         await page.goto(f"{BASE}/v3/ai-history?historyType=all&backModule=CL",
                         wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
+        # DOM 兜底按实际渲染等待，避免每次固定停满 3 秒。
+        try:
+            await page.wait_for_function(
+                "() => document.querySelectorAll('div.history-item').length > 0",
+                timeout=3000)
+        except Exception:
+            # 无任务时仍继续解析空列表；超时上限与旧固定等待一致。
+            pass
         htmls = await page.evaluate(
             "() => Array.from(document.querySelectorAll('div.history-item')).map(e => e.outerHTML)")
         out = []
@@ -198,17 +205,22 @@ def pick_task(tasks):
         warn(f"请输入 1-{len(tasks)}")
 
 # ---------- 2) 提取竞品 ASIN ----------
-async def extract_asins(page, task_id):
+async def extract_asins(page, task_id, timings=None):
+    fetch_started = time.perf_counter()
     j = await api_get(page, f"/v3/api/ai-analysis/task/{task_id}")
+    if timings is not None:
+        timings["fetch_ms"] = round((time.perf_counter() - fetch_started) * 1000)
     d = j.get("data") or {}
     if d.get("taskStatus") != "COMPLETED":
         warn(f"任务状态 {d.get('taskStatus')}，content 可能为空")
     raw = d.get("content") or "[]"
+    if timings is not None:
+        timings["payload_kb"] = round(len(raw.encode("utf-8")) / 1024, 1) if isinstance(raw, str) else 0
+    parse_started = time.perf_counter()
     items = json.loads(raw) if isinstance(raw, str) else raw
     asins, rows = [], []
     for it in items:
         a = (it.get("asin") or "").strip().upper()
-        p = (it.get("parent") or "").strip().upper()
         if a:
             asins.append(a)
             rows.append(it)
@@ -217,6 +229,8 @@ async def extract_asins(page, task_id):
     for a in asins:
         if a not in seen:
             seen.add(a); uniq.append(a)
+    if timings is not None:
+        timings["parse_ms"] = round((time.perf_counter() - parse_started) * 1000)
     return uniq, rows
 
 # ---------- 3) 竞品查询 ----------
