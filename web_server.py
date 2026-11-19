@@ -11,6 +11,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -95,6 +96,17 @@ async def _lifespan(application):
         if active_jobs:
             await asyncio.gather(*active_jobs, return_exceptions=True)
         await asyncio.gather(USPS_QUERY.cancel(), TRACK718_QUERY.cancel(), return_exceptions=True)
+        # Closing the desktop window also stops the shared SellerSprite browser driver.
+        pw = S.get("pw")
+        if pw is not None:
+            try:
+                await asyncio.wait_for(pw.stop(), timeout=3)
+            except Exception:
+                logging.getLogger(__name__).exception("SellerSprite 浏览器驱动关闭失败")
+            finally:
+                S.update(pw=None, browser=None, main_page=None, vip_page=None)
+                S["pool_pages"].clear()
+                LOGIN_SESSIONS.clear()
         for job in S.get("jobs", {}).values():
             if job.get("type") == "amazon_price" and job.get("status") == "running":
                 job["status"] = "error"
