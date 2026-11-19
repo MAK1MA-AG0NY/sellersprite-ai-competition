@@ -22,10 +22,11 @@ from pathlib import Path
 
 import openpyxl
 
+from app_paths import DATA_DIR as HERE
+
 BASE = "https://www.sellersprite.com"
 ADS_URL = f"{BASE}/v3/ads-insights"
 XDS_STAT = f"{BASE}/v3/api/xds/stat"
-HERE = Path(__file__).parent
 ADS_DIR = HERE / "adv_reserach"          # 手动/自动下载的 KeywordHistory-*.xlsx 都放这
 RES_DIR = HERE / "搭建资源"               # 关键词反查/挖掘等导出样本与资料
 ADS_DEBUG = HERE / "ads_debug"

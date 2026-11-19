@@ -10,9 +10,9 @@
 import json
 import sqlite3
 from datetime import datetime
-from pathlib import Path
 
-HERE = Path(__file__).parent
+from app_paths import DATA_DIR as HERE
+
 DB_PATH = HERE / "deep_results" / "deepdive.db"
 
 SCHEMA = """

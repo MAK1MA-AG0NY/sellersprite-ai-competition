@@ -22,12 +22,12 @@ import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 
 from playwright.async_api import async_playwright
 
+from app_paths import DATA_DIR as HERE
+
 BASE = "https://www.sellersprite.com"
-HERE = Path(__file__).parent
 STATE_FILE = HERE / "storage_state.json"               # 主账号：AI找竞品（可自由更换）
 MEMBER_STATE_FILE = HERE / "storage_state_member.json"  # 会员账号：competitor-lookup 专用（固定）
 LOOKUP_CFG = HERE / "lookup_api.json"

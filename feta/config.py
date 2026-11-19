@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Mapping
 
-ROOT = Path(__file__).resolve().parent.parent
+from app_paths import DATA_DIR as ROOT
 
 
 class ConfigError(ValueError):

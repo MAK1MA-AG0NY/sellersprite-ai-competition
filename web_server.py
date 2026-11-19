@@ -25,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from playwright.async_api import async_playwright
 
+from app_paths import ASSET_DIR
 import sellersprite_deep_dive as sd
 import sellersprite_ai_report as ai   # CL 页面下拉框操作(detect_selects/set_select)在这里
 import local_db
@@ -53,7 +54,7 @@ STATE_FILE = sd.STATE_FILE
 MEMBER_STATE_FILE = sd.MEMBER_STATE_FILE
 LOOKUP_CFG = sd.LOOKUP_CFG
 OUT_DIR = HERE / "deep_results"
-WEB_INDEX = HERE / "web_index.html"
+WEB_INDEX = ASSET_DIR / "web_index.html"
 POOL_DIR = HERE / "states"          # 主账号池登录态：states/main_{N}.json
 
 FETCH_GET = sd.FETCH_GET

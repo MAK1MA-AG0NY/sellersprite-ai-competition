@@ -21,13 +21,13 @@ import random
 import re
 import sys
 import time
-from pathlib import Path
 
 from playwright.async_api import async_playwright
 
+from app_paths import DATA_DIR as HERE
+
 BASE = "https://www.sellersprite.com"
 PAGE_URL = f"{BASE}/v3/ai-history?module=CL"
-HERE = Path(__file__).parent
 STATE_FILE = HERE / "storage_state.json"
 RESULT_DIR = HERE / "results"
 HEADLESS = os.environ.get("HEADLESS", "1") != "0"
