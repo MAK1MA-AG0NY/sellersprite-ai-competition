@@ -130,18 +130,23 @@ def show_desktop(url):
         completed.set()
 
     def watchdog():
-        if not completed.wait(timeout=15) and not window.events.closed.is_set():
-            timed_out.set()
-            logger.warning("WebView2 页面没有在规定时间内加载")
-            if window.events.shown.is_set():
-                window.destroy()
+        if completed.wait(timeout=15):
+            return
+        # pywebview dispatches event callbacks asynchronously.
+        if completed.is_set() or window.events.loaded.is_set() or window.events.closed.is_set():
+            return
+        timed_out.set()
+        logger.warning("WebView2 窗口显示后 15 秒仍未加载页面")
+        window.destroy()
 
     # pywebview can otherwise silently fall back to the obsolete MSHTML engine.
     window.events.initialized += lambda renderer: renderer == "edgechromium"
     window.events.loaded += loaded
     window.events.closed += completed.set
+    # Time the page load, not the native window's creation.
+    window.events.shown += watchdog
     try:
-        webview.start(func=watchdog, gui="edgechromium", icon=str(ICON_PATH),
+        webview.start(gui="edgechromium", icon=str(ICON_PATH),
                       private_mode=False, storage_path=str(DATA_DIR / "webview2"))
     finally:
         completed.set()

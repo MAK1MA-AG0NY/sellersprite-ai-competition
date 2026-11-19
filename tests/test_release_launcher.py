@@ -1,16 +1,81 @@
 """Offline desktop launcher tests; no GUI, account, or live website needed."""
 
 import logging
+import sys
 import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import release_launcher as launcher
 
 
+class _WindowEvent:
+    def __init__(self):
+        self.callbacks = []
+        self.fired = False
+
+    def __iadd__(self, callback):
+        self.callbacks.append(callback)
+        return self
+
+    def is_set(self):
+        return self.fired
+
+    def emit(self):
+        self.fired = True
+        for callback in self.callbacks:
+            callback()
+
+
 class DesktopLauncherTests(unittest.TestCase):
+    def _simulate_slow_window_creation(self, *, page_loads):
+        events = SimpleNamespace(**{name: _WindowEvent() for name in ("initialized", "shown", "loaded", "closed")})
+        window = SimpleNamespace(events=events, destroy=Mock(side_effect=events.closed.emit))
+        completed = threading.Event()
+        waited_while_shown = []
+
+        def wait_for_load(timeout):
+            shown = events.shown.is_set()
+            waited_while_shown.append(shown)
+            if page_loads and shown:
+                events.loaded.emit()
+            return completed.is_set()
+
+        completed.wait = wait_for_load
+
+        def start(func=None, **_):
+            # A launch-time watchdog exhausts its deadline before the form appears.
+            if func is not None:
+                func()
+            events.shown.emit()
+            if not events.closed.is_set():
+                if page_loads and not events.loaded.is_set():
+                    events.loaded.emit()
+                events.closed.emit()  # User closes the window normally.
+
+        webview = SimpleNamespace(__file__=__file__, settings={}, create_window=Mock(return_value=window), start=start)
+        fake_threading = SimpleNamespace(Event=Mock(side_effect=[completed, threading.Event()]))
+        with (patch.dict(sys.modules, webview=webview),
+              patch.object(launcher, "installed_webview2", return_value=True),
+              patch.object(launcher, "threading", fake_threading)):
+            normal_close = launcher.show_desktop("http://127.0.0.1:8765/")
+        return normal_close, window.destroy, waited_while_shown
+
+    def test_late_window_load_can_close_without_browser_fallback(self):
+        normal_close, destroy, waits = self._simulate_slow_window_creation(page_loads=True)
+        self.assertTrue(normal_close)
+        destroy.assert_not_called()
+        self.assertEqual(waits, [True])
+
+    def test_visible_window_that_never_loads_still_falls_back(self):
+        with self.assertLogs(launcher.logger, level=logging.WARNING):
+            normal_close, destroy, waits = self._simulate_slow_window_creation(page_loads=False)
+        self.assertFalse(normal_close)
+        destroy.assert_called_once_with()
+        self.assertEqual(waits, [True])
+
     def test_closing_the_ui_joins_the_server_worker(self):
         stop = threading.Event()
         worker_exited = threading.Event()
