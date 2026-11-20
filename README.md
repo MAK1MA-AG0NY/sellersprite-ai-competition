@@ -88,14 +88,14 @@ web_server.py  ──┬── sellersprite_deep_dive.py   （历史 / 查询 / 
 
 ### Windows 便携版（给同事）
 
-将 `dist/SellerSpriteCompetition-v0.1.0-windows-x64.zip` 完整解压，双击 `SellerSpriteCompetition.exe`。内置 Python 和 Chromium，无需安装依赖；界面在默认浏览器中打开。详细步骤见 [便携版使用说明](docs/Windows-portable-readme.txt)。
+将 Windows x64 发行 ZIP 完整解压，双击 `SellerSpriteCompetition.exe`。桌面预览版默认使用系统 WebView2 显示独立窗口，不弹出 CMD；若 WebView2 不可用，会回退到默认浏览器。内置自动化使用的 Chromium，与界面使用的 WebView2 相互独立。详细步骤见 [便携版使用说明](docs/Windows-portable-readme.txt)。
 
 发行包不包含现有业务数据；登录态、数据库和报告由各 Windows 用户保存在 `%LOCALAPPDATA%\SellerSpriteCompetition`。源码运行时仍使用原目录结构。
 
 **重新打包（维护者，Windows x64）：** 在项目目录运行下列命令。首次构建会下载依赖和 Chromium；后续可复用浏览器缓存。
 
 ```powershell
-uv run --no-project --python 3.14 --with-requirements requirements.txt --with pyinstaller==6.19.0 python build_release.py
+uv run --no-project --python 3.14 --with-requirements requirements-desktop.txt --with pyinstaller==6.19.0 python build_release.py
 ```
 
 若已有可信的 Playwright 浏览器缓存，可在命令末尾追加 `--browser-cache 'C:\path\to\.pw-browsers'`。只需分发生成的 ZIP，不要把数据目录或开发环境附带进去。

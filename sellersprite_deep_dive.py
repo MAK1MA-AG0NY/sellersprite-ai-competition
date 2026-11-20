@@ -35,7 +35,8 @@ OUT_DIR = HERE / "deep_results"
 HEADLESS = os.environ.get("HEADLESS", "1") != "0"
 
 # ---------- 终端美化 ----------
-os.system("")
+if sys.stdout is not None and sys.stdout.isatty():
+    os.system("")
 
 class C:
     R = "\033[0m"; B = "\033[1m"; D = "\033[2m"

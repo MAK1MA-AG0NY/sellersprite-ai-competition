@@ -1,0 +1,4 @@
+-r requirements.txt
+pywebview==6.2.1
+pythonnet==3.2.1
+clr-loader==0.3.1

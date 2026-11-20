@@ -37,7 +37,8 @@ DELAY_RANGE = (15, 30)     # 多个 ASIN 之间的随机间隔（秒）
 
 # ---------- 终端美化 ----------
 
-os.system("")  # Windows 控制台启用 ANSI 转义
+if sys.stdout is not None and sys.stdout.isatty():
+    os.system("")  # 仅在控制台启用 ANSI 转义；桌面版不启动 CMD。
 
 class C:
     RESET  = "\033[0m"

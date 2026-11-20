@@ -72,10 +72,12 @@ def build(browser_cache=None):
             "PYINSTALLER_CONFIG_DIR": str(work_root / "pyinstaller-cache"),
         }
         prepare_browsers(cache, layout, env, download=browser_cache is None)
+        icon = ROOT / "assets" / "app.ico"
         subprocess.run([
-            sys.executable, "-m", "PyInstaller", "--noconfirm", "--onedir", "--noupx",
+            sys.executable, "-m", "PyInstaller", "--noconfirm", "--onedir", "--windowed", "--noupx",
             "--name", APP_NAME, "--distpath", str(work / "app"), "--workpath", str(work / "work"),
             "--specpath", str(work), "--contents-directory", "_internal",
+            "--icon", str(icon), "--add-data", f"{icon}:assets",
             "--add-data", f"{ROOT / 'web_index.html'}:.",
             "--hidden-import", "uvicorn.protocols.http.h11_impl", "--hidden-import", "uvicorn.lifespan.on",
             "release_launcher.py",
