@@ -642,9 +642,13 @@ class BrowserSelectorTests(unittest.IsolatedAsyncioTestCase):
             product = (f'<a id="nav-global-location-popover-link">{delivery["label"]}</a>'
                        f'<span id="productTitle">Power station</span><input id="ASIN" value="{ASIN}">'
                        '<div id="corePrice_desktop">'
-                       '<span class="a-price apex-price-to-pay-value"><span class="a-offscreen">$299.00</span></span>'
-                       '<span class="a-price apex-basis-price-value"><span class="a-offscreen">$399.00</span></span>'
-                       '</div><div id="availability">In Stock</div>')
+                       '<span class="a-price apex-price-to-pay-value"><span class="a-offscreen">$1,196.00</span></span>'
+                       '</div>'
+                       '<span aria-hidden="true" class="a-size-small a-color-secondary aok-align-center basisPrice">'
+                       '<span class="apex-basisprice-label">List Price:</span>'
+                       '<span class="a-price a-text-price apex-basisprice-value" data-a-size="s" data-a-strike="true" data-a-color="secondary">'
+                       '<span class="a-offscreen">$1,329.00</span><span aria-hidden="true">$1,329.00</span></span></span>'
+                       '<div id="availability">In Stock</div>')
             await route.fulfill(content_type="text/html", body=home if path == "/" else product)
 
         async with async_playwright() as pw:
@@ -655,8 +659,9 @@ class BrowserSelectorTests(unittest.IsolatedAsyncioTestCase):
                 await patrol.prepare_us_delivery(page)
                 self.assertIn("10001", await page.locator("#nav-global-location-popover-link").inner_text())
                 data, _ = await patrol.collect_page(page, ASIN)
-                self.assertEqual(data["price"], "299.00")
-                self.assertEqual(data["reference_price"], "399.00")
+                self.assertEqual(data["price"], "1196.00")
+                self.assertEqual(data["reference_price"], "1329.00")
+                self.assertIn("reference_discount", data["offer_types"])
                 delivery["label"] = "Malaysia"
                 with self.assertRaises(patrol.ObservationError):
                     await patrol.collect_page(page, ASIN)

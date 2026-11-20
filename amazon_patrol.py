@@ -111,6 +111,30 @@ EXTRACT_PRODUCT = r"""() => {
     const fraction = text(price.querySelector('.a-price-fraction')) || '00';
     return symbol && whole ? symbol + whole + '.' + fraction : text(price);
   };
+  const referencePriceValue = () => {
+    // 新版 List Price 有时从 corePrice_* 容器移出，标记为 .basisPrice / .apex-basisprice-value。
+    // 先读这些明确的划线价标记；从容器取值也能兼容 a-offscreen 被视觉隐藏的情况。
+    const basisSelectors = [
+      '#corePriceDisplay_desktop_feature_div .basisPrice', '#corePrice_feature_div .basisPrice',
+      '#corePrice_desktop .basisPrice', '#apex_desktop .basisPrice', '.basisPrice',
+      '#corePriceDisplay_desktop_feature_div .apex-basisprice-value',
+      '#corePrice_feature_div .apex-basisprice-value', '#corePrice_desktop .apex-basisprice-value',
+      '#apex_desktop .apex-basisprice-value', '.apex-basisprice-value',
+      '#corePrice_desktop .apex-basis-price-value', '.apex-basis-price-value'
+    ];
+    for (const selector of basisSelectors) {
+      for (const el of document.querySelectorAll(selector)) {
+        if (!visible(el)) continue;
+        const value = priceValue(el);
+        if (value) return value;
+      }
+    }
+    return first([
+      '#corePriceDisplay_desktop_feature_div .a-text-price .a-offscreen',
+      '#corePrice_feature_div .a-text-price .a-offscreen',
+      '#priceblock_listprice', '#listPrice', '#listPriceLegalMessage .a-offscreen'
+    ]);
+  };
   const couponSelectors = ['#couponFeature', '#coupon_feature_div', '#couponText',
     '#promoPriceBlockMessage_feature_div .couponLabelText'];
   const promoSelectors = ['#promotions_feature_div', '#promotion_feature_div',
@@ -138,13 +162,7 @@ EXTRACT_PRODUCT = r"""() => {
     page_asin: document.querySelector('#ASIN')?.value ||
       document.querySelector('input[name="ASIN"]')?.value || '',
     price_text: firstPurchasePrice(),
-    reference_price_text: first([
-      '#corePriceDisplay_desktop_feature_div .a-text-price .a-offscreen',
-      '#corePrice_feature_div .a-text-price .a-offscreen',
-      '#corePrice_desktop .apex-basis-price-value .a-offscreen',
-      '#corePrice_desktop .apex-basisprice-value .a-offscreen', '#priceblock_listprice',
-      '#listPrice', '#listPriceLegalMessage .a-offscreen'
-    ]),
+    reference_price_text: referencePriceValue(),
     price_region_seen: present(['#corePriceDisplay_desktop_feature_div', '#corePrice_feature_div', '#corePrice_desktop',
       '#priceblock_ourprice', '#priceblock_dealprice']),
     delivery_location: first(['#glow-ingress-block', '#nav-global-location-popover-link']),
