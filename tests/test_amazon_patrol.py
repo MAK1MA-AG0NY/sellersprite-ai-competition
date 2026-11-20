@@ -297,10 +297,13 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         await self.server.amazon_save_watch({"group_id":group_id,"asins":"\n".join(asins)})
         now = self.server.datetime.now(self.server.AMZ_SHANGHAI).isoformat(timespec="seconds")
         yesterday = (self.server.datetime.now(self.server.AMZ_SHANGHAI) - self.server.timedelta(days=1)).isoformat(timespec="seconds")
-        for asin, price in zip(asins[:3], ("249.00","299.00","329.00")):
-            local_db.amz_record(asin, {"title":"Synthetic product","price":price,"currency":"USD","availability":"available",
+        for index, (asin, price) in enumerate(zip(asins[:3], ("249.00","299.00","329.00"))):
+            observation = {"title":"Synthetic product","price":price,"currency":"USD","availability":"available",
                 "offer_read_status":"observed","offer_observed_at":now,
-                "offer_evidence":[{"type":"coupon","text":"Save $20 with coupon"}]}, checked_at=now)
+                "offer_evidence":[{"type":"coupon","text":"Save $20 with coupon"}]}
+            if index == 0:
+                observation["reference_price"] = "299.00"
+            local_db.amz_record(asin, observation, checked_at=now)
         local_db.amz_record(asins[3], {"price":"100.00","currency":"USD","availability":"available"}, checked_at=yesterday)
         local_db.amz_record(asins[4], {"price":"90.00","currency":"USD","availability":"available"}, checked_at=yesterday)
         local_db.amz_record(asins[5], {"price":"80.00","currency":"USD","availability":"available",
@@ -343,7 +346,7 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[asins[8]]["status"], "今日状态未确认")
         self.assertEqual(rows[asins[8]]["price"], "—")
         self.assertFalse(rows[asins[8]]["below_own_price"])
-        self.assertEqual(rows[asins[0]]["offer"], "Save $20 with coupon")
+        self.assertEqual(rows[asins[0]]["offer"], "划线价 $299.00；Save $20 with coupon")
         self.assertTrue(rows[asins[9]]["below_own_price"])
         self.assertEqual(rows[asins[9]]["status"], "今日已检查（库存未确认）")
         self.assertEqual(rows[asins[9]]["offer"], "本次优惠未读取")

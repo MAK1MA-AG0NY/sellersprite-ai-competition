@@ -2475,13 +2475,16 @@ def _amz_simple_offer_read_today(current, successful_today):
 def _amz_simple_offer(current, successful_today):
     if not successful_today:
         return "—"
+    reference = (_amz_simple_decimal(current.get("reference_price"))
+                 if current.get("currency") == "USD" else None)
+    reference_text = f"划线价 ${reference:.2f}" if reference is not None else ""
     if not _amz_simple_offer_read_today(current, successful_today):
-        return "本次优惠未读取"
+        return "；".join(value for value in (reference_text, "本次优惠未读取") if value)
     status = current.get("offer_read_status")
     if status == "read_no_explicit_offer":
-        return "今日未发现明确优惠"
+        return reference_text or "今日未发现明确优惠"
     if status != "observed":
-        return "优惠状态待确认"
+        return "；".join(value for value in (reference_text, "优惠状态待确认") if value)
     visible_types = {"coupon", "promotion", "lightning_deal", "limited_time_deal", "prime_exclusive"}
     details = []
     for entry in current.get("offer_evidence", []) if isinstance(current.get("offer_evidence"), list) else []:
@@ -2490,7 +2493,7 @@ def _amz_simple_offer(current, successful_today):
         text = str(entry.get("text") or "").strip()
         if text and text not in details:
             details.append(text)
-    return "；".join(details) if details else "今日未发现明确优惠"
+    return "；".join(([reference_text] if reference_text else []) + details) or "今日未发现明确优惠"
 
 
 @app.get("/api/amazon/simple")
