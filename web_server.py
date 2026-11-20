@@ -3192,6 +3192,14 @@ async def tracking_fedex_email_accept_all(req: dict):
 
 # ---------- 页面 ----------
 
+@app.get("/price-workspace/", include_in_schema=False)
+async def price_workspace():
+    page = ASSET_DIR / "frontend" / "price-workspace" / "dist" / "index.html"
+    if page.is_file():
+        return FileResponse(page, headers={"Cache-Control": "no-cache"})
+    raise HTTPException(404, "价格巡查预览未构建；请在 frontend/price-workspace 运行 npm ci 和 npm run build，或访问 /#amazon 使用旧版。")
+
+
 @app.get("/")
 async def index():
     if WEB_INDEX.exists():
