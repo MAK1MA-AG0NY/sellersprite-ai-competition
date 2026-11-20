@@ -100,6 +100,10 @@ uv run --no-project --python 3.14 --with-requirements requirements.txt --with py
 
 若已有可信的 Playwright 浏览器缓存，可在命令末尾追加 `--browser-cache 'C:\path\to\.pw-browsers'`。只需分发生成的 ZIP，不要把数据目录或开发环境附带进去。
 
+### Amazon 价格巡查界面预览（可选）
+
+不替换旧界面，也不影响便携版。参见[构建和试用说明](frontend/price-workspace/README.md)：可直接打开构建出的 HTML 试用离线样例，也可用 `/price-workspace/` 连接本地数据。
+
 ### 源码运行 · 前置条件
 
 - Windows 10/11
